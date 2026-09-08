@@ -1,0 +1,18 @@
+[package]
+name = "qaas-types"
+description = "Shared wire types (message envelope, identifiers, error types) used by the QaaS core engine, server, and client SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true

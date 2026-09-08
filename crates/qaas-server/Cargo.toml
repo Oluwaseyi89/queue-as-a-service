@@ -1,0 +1,24 @@
+[package]
+name = "qaas-server"
+description = "The QaaS broker binary: wires the qaas-core engine up to a network-facing API (gRPC/HTTP/MCP)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "qaas-server"
+path = "src/main.rs"
+
+[dependencies]
+qaas-core.workspace = true
+qaas-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

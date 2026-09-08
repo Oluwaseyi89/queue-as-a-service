@@ -1,0 +1,6 @@
+# Pins the toolchain so `cargo build`, `cargo fmt`, and `cargo clippy`
+# behave identically for every contributor and in CI, instead of drifting
+# with whatever stable happens to be installed locally.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

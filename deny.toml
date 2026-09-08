@@ -1,0 +1,32 @@
+# cargo-deny configuration: run with `cargo deny check` once the tool is
+# installed (`cargo install cargo-deny`). Wiring this into CI is
+# `feature/cicd-pipeline`'s job — this file just defines the policy so
+# that branch has something to enforce instead of inventing it under
+# pipeline-deadline pressure.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

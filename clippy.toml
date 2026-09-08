@@ -1,0 +1,6 @@
+# `clippy::doc_markdown` (enabled via the `pedantic` group in the
+# workspace lints) wants mixed-case words in doc comments backticked as
+# probable code identifiers. "QaaS" is the project's own name and appears
+# in prose throughout every crate's docs, so it's listed here as an
+# intentional exception rather than getting backticked hundreds of times.
+doc-valid-idents = ["QaaS", "..default.."]

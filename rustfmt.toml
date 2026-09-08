@@ -1,0 +1,6 @@
+# Kept to stable-channel-only options deliberately: contributors on plain
+# `rustup default stable` should get identical output to CI without also
+# needing a nightly toolchain just to run `cargo fmt`.
+edition = "2024"
+newline_style = "Unix"
+use_small_heuristics = "Max"
