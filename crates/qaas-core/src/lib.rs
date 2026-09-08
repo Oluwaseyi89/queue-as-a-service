@@ -10,7 +10,16 @@
 //! property tests, and reused unmodified if we ever want a second
 //! transport (e.g. an embedded, in-process mode) alongside the broker.
 //!
-//! Nothing is implemented yet. The queue data structures land in
-//! `feature/in-memory-queue-core`, and this crate exists first so that
-//! work — and `qaas-server`'s dependency on it — has a stable crate
-//! boundary to build against from the start.
+//! [`queue::FifoQueue`] and [`queue::PriorityQueue`] are the first thing
+//! implemented here (`feature/in-memory-queue-core`): async-safe,
+//! in-memory queue data structures with no durability, no delivery
+//! semantics (no ack/nack, no redelivery), and no idea what a "message
+//! envelope" looks like — those are `feature/wal-persistence`,
+//! `feature/consumer-groups`, and `feature/message-schema-versioning`
+//! respectively. Both queue types are generic over an arbitrary payload
+//! type so they don't need to wait on the wire schema to be useful and
+//! testable on their own.
+
+pub mod queue;
+
+pub use queue::{FifoQueue, Priority, PriorityQueue};
