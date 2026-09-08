@@ -1,0 +1,20 @@
+# Local dev scrape config.
+#
+# qaas-server doesn't expose a /metrics endpoint yet — that lands in
+# feature/tracing-metrics (Phase 6). The qaas-server target below is
+# defined now, pointed at the port OpenTelemetry's Prometheus exporter
+# conventionally uses (9464), so Prometheus is already wired up and just
+# needs the endpoint to exist once that branch lands, instead of this
+# file being written from scratch then too. Until then this target will
+# show as "down" in Prometheus, which is expected, not a bug.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: qaas-server
+    static_configs:
+      - targets: ["queue-node:9464"]

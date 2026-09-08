@@ -1,0 +1,17 @@
+# Tells Grafana to auto-load any dashboard JSON file dropped into this
+# same directory on startup. No dashboards exist yet — building the
+# actual queue-depth/DLQ/token-spend dashboard is
+# feature/monitoring-dashboard's job (Phase 6). This provider config
+# exists now so that branch only has to add a JSON file here, not wire up
+# provisioning from scratch.
+apiVersion: 1
+
+providers:
+  - name: QaaS
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
