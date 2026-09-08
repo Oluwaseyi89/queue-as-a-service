@@ -1,0 +1,12 @@
+# Auto-provisions Prometheus as Grafana's default data source on
+# startup, so contributors don't have to click through the "Add data
+# source" flow by hand.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

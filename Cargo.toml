@@ -19,7 +19,7 @@ qaas-types = { path = "crates/qaas-types" }
 qaas-core = { path = "crates/qaas-core" }
 qaas-client = { path = "crates/qaas-client" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

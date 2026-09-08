@@ -1,0 +1,53 @@
+# Local dev stack: one qaas-server node plus Prometheus + Grafana, so
+# contributors can build and iterate on metrics/dashboards without a real
+# cluster. This is NOT the HA cluster — that's a future sibling compose
+# file from feature/docker-ha-cluster (Phase 8), with N node replicas and
+# a load balancer. Here it's one node, for one laptop.
+#
+# Run from the repo root with `just up`, or directly:
+#   docker compose -f docker/docker-compose.yml up --build
+
+services:
+  queue-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: qaas-queue-node
+    environment:
+      RUST_LOG: info,qaas_server=debug
+    restart: unless-stopped
+    # No ports published yet: qaas-server doesn't bind a socket until a
+    # network API lands (feature/mcp-server-interface and friends). Add
+    # the port mapping here once it does.
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: qaas-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    container_name: qaas-grafana
+    environment:
+      # Dev-only convenience: skip the login screen entirely. Never do
+      # this in the production/HA stack (feature/docker-ha-cluster).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:
