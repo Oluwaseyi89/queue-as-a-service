@@ -80,8 +80,16 @@ All four must pass clean. Notes on the config behind them:
   project's own name and would otherwise need backticks in every doc
   comment.
 - **`deny.toml`** defines the license/advisory policy for
-  `cargo-deny check`. Not yet wired into CI (that's `feature/cicd-pipeline`)
-  — until then, run it manually when adding a new dependency.
+  `cargo-deny check`, enforced in CI as its own job
+  (`.github/workflows/ci.yml`) so a disallowed license or a known
+  advisory fails the PR the same way a clippy warning does.
+
+CI (`.github/workflows/ci.yml`) runs a fast `lint` job (fmt-check +
+clippy) that gates separate `build`, `test`, and `cargo-deny` jobs — mirrors
+the lint-gates-everything shape from global-rate-limiter's `ci.yml`, just
+with Rust tooling in place of Go's. It reuses `rust-toolchain.toml` as the
+toolchain source of truth rather than re-pinning a version in the
+workflow file.
 
 ## Reference Architecture: global-rate-limiter
 

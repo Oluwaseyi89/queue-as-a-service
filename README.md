@@ -1,4 +1,7 @@
 # queue-as-a-service
+
+[![CI](https://github.com/Oluwaseyi89/queue-as-a-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Oluwaseyi89/queue-as-a-service/actions/workflows/ci.yml)
+
 Queue-as-a-Service (QaaS) — an MCP-native, agent-first message queue built in Rust. Durable, resumable agent workflows, token/cost-aware admission control, semantic dedup, and LLM-assisted DLQ triage, on top of HA Raft clustering, FIFO/priority queues, and consumer groups. Built for the AI agent era, not just microservices.
 
 ## Workspace Layout
@@ -24,5 +27,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 `cargo deny check` additionally enforces the license/advisory policy in
-[`deny.toml`](deny.toml) once you `cargo install cargo-deny` locally — CI
-wiring for all of the above lands in `feature/cicd-pipeline`.
+[`deny.toml`](deny.toml) — install it locally with `cargo install
+cargo-deny`. All four checks above, plus `cargo-deny`, run in
+[CI](.github/workflows/ci.yml) on every push and pull request against
+`main`.
