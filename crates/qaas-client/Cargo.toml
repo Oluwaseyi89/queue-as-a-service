@@ -1,0 +1,14 @@
+[package]
+name = "qaas-client"
+description = "Rust client SDK for producers and consumers talking to a QaaS broker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+qaas-types.workspace = true

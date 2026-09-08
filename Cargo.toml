@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Shared metadata every crate in the workspace inherits via `field.workspace
+# = true`. Keeping it here means bumping the version or edition for the
+# whole project is a one-line change instead of four.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Isenewo Oluwaseyi Ephraim <isenewoephr2012@gmail.com>"]
+repository = "https://github.com/Oluwaseyi89/queue-as-a-service"
+
+# Path deps between our own crates, and every third-party dep pinned once
+# here so version drift between crates isn't possible.
+[workspace.dependencies]
+qaas-types = { path = "crates/qaas-types" }
+qaas-core = { path = "crates/qaas-core" }
+qaas-client = { path = "crates/qaas-client" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Workspace-wide lint policy. Every member crate opts in with
+# `[lints] workspace = true` so we don't have to repeat this four times.
+# `missing_docs` is deliberately on: this project is meant to be heavily
+# commented, and the lint is what actually enforces that over time instead
+# of relying on code review to catch undocumented public items.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
