@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 crc32fast = "1"
 tempfile = "3"
+fastrand = "2"
 
 # Workspace-wide lint policy. Every member crate opts in with
 # `[lints] workspace = true` so we don't have to repeat this four times.
