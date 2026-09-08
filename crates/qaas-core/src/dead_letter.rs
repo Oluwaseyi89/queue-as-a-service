@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use qaas_types::{MessageId, Timestamp};
+use qaas_types::{IdempotencyKey, MessageId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -35,6 +35,13 @@ pub struct DeadLetter<T> {
     /// one, so a message stays traceable across the round trip through
     /// the DLQ.
     pub id: MessageId,
+    /// The producer-supplied idempotency key this message was enqueued
+    /// with, if any — carried along so
+    /// [`ConsumerGroup::reprocess_dead_letter`](crate::ConsumerGroup::reprocess_dead_letter)
+    /// can re-register it and
+    /// [`ConsumerGroup::purge_dead_letter`](crate::ConsumerGroup::purge_dead_letter)
+    /// can release it; see `feature/idempotent-delivery`.
+    pub idempotency_key: Option<IdempotencyKey>,
     /// The message payload.
     pub item: T,
     /// How many times this message was delivered in total before it was
@@ -117,6 +124,22 @@ impl<T: Serialize + DeserializeOwned> DeadLetterQueue<T> {
         self.entries.lock().await.values().cloned().collect()
     }
 
+    /// The id and idempotency key (if any) of every dead letter
+    /// currently held. Doesn't need `T: Clone` the way
+    /// [`list`](Self::list) does — for a caller that only needs to know
+    /// *which* messages and keys are dead-lettered, not their payloads
+    /// (`ConsumerGroup::open` rebuilding its dedup map after a restart,
+    /// specifically), this avoids requiring a bound the type it's
+    /// holding might not have.
+    pub async fn ids_and_keys(&self) -> Vec<(MessageId, Option<IdempotencyKey>)> {
+        self.entries
+            .lock()
+            .await
+            .values()
+            .map(|dead_letter| (dead_letter.id, dead_letter.idempotency_key.clone()))
+            .collect()
+    }
+
     /// The number of dead letters currently held.
     pub async fn len(&self) -> usize {
         self.entries.lock().await.len()
@@ -164,6 +187,7 @@ mod tests {
     fn sample(id: MessageId, item: i32) -> DeadLetter<i32> {
         DeadLetter {
             id,
+            idempotency_key: None,
             item,
             delivery_count: 5,
             last_error: Some("downstream returned 429".to_string()),
@@ -223,5 +247,20 @@ mod tests {
         assert_eq!(recovered.len().await, 1);
         let listed = recovered.list().await;
         assert_eq!(listed[0].id, kept_id);
+    }
+
+    #[tokio::test]
+    async fn ids_and_keys_reports_every_entry_without_requiring_clone() {
+        let dir = tempdir().unwrap();
+        let dlq = DeadLetterQueue::open(dir.path().join("dlq.log")).await.unwrap();
+        let id = MessageId::new();
+        let key = qaas_types::IdempotencyKey::new("order-42").unwrap();
+
+        let mut with_key = sample(id, 1);
+        with_key.idempotency_key = Some(key.clone());
+        dlq.record(with_key).await.unwrap();
+
+        let entries = dlq.ids_and_keys().await;
+        assert_eq!(entries, vec![(id, Some(key))]);
     }
 }
