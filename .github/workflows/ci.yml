@@ -1,0 +1,103 @@
+# CI for the QaaS Cargo workspace. Mirrors the job shape from
+# global-rate-limiter's ci.yml (github.com/Oluwaseyi89/global-rate-limiter):
+# a fast lint job gates everything else, so a formatting or clippy failure
+# fails in seconds instead of after a full build+test run.
+#
+# The four `cargo` invocations below are deliberately copy-pasted verbatim
+# from CLAUDE.md's "Before Calling Any Rust Change Done" checklist — that
+# file is the single source of truth for what "passing" means locally and
+# in CI, so if one changes, the other must too.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel a superseded run (e.g. a second push to the same PR) instead of
+# burning runner time on a result nobody will look at.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # rust-toolchain.toml pins the channel and the rustfmt/clippy
+      # components; running `rustup show` in the repo root is what
+      # actually triggers rustup to install that exact toolchain, so we
+      # don't duplicate the pin in this workflow.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+  cargo-deny:
+    name: cargo-deny (licenses & advisories)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Enforces the policy in deny.toml (license allowlist, advisory
+      # database, banned duplicate/wildcard deps). This is the CI wiring
+      # deny.toml was written for back in feature/cargo-workspace-scaffolding
+      # — it was deliberately left unenforced until this branch.
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
