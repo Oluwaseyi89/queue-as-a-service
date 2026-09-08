@@ -3,12 +3,20 @@ use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
 /// A message's priority within a [`PriorityQueue`]. Higher values are
 /// dequeued before lower ones; `Priority(0)` (the default) is the lowest
 /// priority a message can have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+///
+/// `Serialize`/`Deserialize` are derived so a `Priority` can be written
+/// into a [`PersistentPriorityQueue`](super::PersistentPriorityQueue)'s
+/// WAL record alongside the item it belongs to — replay needs it back to
+/// reproduce the original ordering, not just the set of enqueued items.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Priority(pub u8);
 
 /// A single slot in the heap: the payload plus enough bookkeeping to
