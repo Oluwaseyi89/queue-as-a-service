@@ -15,15 +15,27 @@
 //! no delivery semantics. [`wal::Wal`] and the [`queue::PersistentFifoQueue`]
 //! / [`queue::PersistentPriorityQueue`] wrappers built on it
 //! (`feature/wal-persistence`) add durability: enqueues and dequeues
-//! survive a crash. Still missing, deliberately: any idea what a
-//! "message envelope" looks like (`feature/message-schema-versioning`),
-//! and real delivery semantics — ack/nack, redelivery, visibility
-//! timeout (`feature/consumer-groups`). Both queue types stay generic
-//! over an arbitrary payload type throughout, so none of this needs to
-//! wait on the wire schema to be useful and testable on its own.
+//! survive a crash, but "dequeue" is still a single, irreversible step —
+//! there's no way to get a message back if whoever dequeued it crashes
+//! before finishing with it. [`consumer_group::ConsumerGroup`]
+//! (`feature/consumer-groups`) replaces that with lease-based delivery
+//! (claim/ack/nack, visibility timeouts) for real at-least-once
+//! semantics under multiple competing consumers. Still missing,
+//! deliberately: retry/backoff policy and a dead-letter destination for
+//! messages that keep failing (`feature/retry-and-backoff-policies`,
+//! `feature/dead-letter-queue`) — `ConsumerGroup` exposes a delivery
+//! count as data, but makes no decisions based on it.
+//!
+//! This is also the first thing in this crate to depend on
+//! [`qaas_types`]: `ConsumerGroup` reuses `qaas_types::MessageId` for
+//! message identity rather than inventing a second ID type, since the
+//! whole reason `MessageId` was built as `UUIDv7` (time-ordered) applies
+//! just as much here as in [`Envelope`](qaas_types::Envelope).
 
+pub mod consumer_group;
 pub mod queue;
 pub mod wal;
 
+pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
 pub use wal::Wal;
