@@ -1,5 +1,5 @@
 # queue-as-a-service
-Queue-as-a-Service (QaaS) – High-performance, distributed message queue with persistence, dead-letter handling, and at-least-once delivery. Built in Rust for memory safety and speed. Features FIFO/priority queues, consumer groups, retry policies, monitoring dashboard, and HA Docker cluster for microservices needing reliable async communication.
+Queue-as-a-Service (QaaS) — an MCP-native, agent-first message queue built in Rust. Durable, resumable agent workflows, token/cost-aware admission control, semantic dedup, and LLM-assisted DLQ triage, on top of HA Raft clustering, FIFO/priority queues, and consumer groups. Built for the AI agent era, not just microservices.
 
 ## Workspace Layout
 
