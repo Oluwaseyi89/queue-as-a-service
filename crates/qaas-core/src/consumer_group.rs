@@ -38,6 +38,24 @@
 //! retry — durably, with the failure reason attached, so an operator (or
 //! `feature/llm-assisted-dlq-triage`, later) has somewhere to look
 //! instead of the message just disappearing.
+//!
+//! Idempotency (`feature/idempotent-delivery`) works on two sides of
+//! this type, for two different reasons. On the producer side,
+//! [`enqueue_with_key`](ConsumerGroup::enqueue_with_key) deduplicates
+//! against a caller-supplied [`IdempotencyKey`]: a retried enqueue call
+//! (a producer that timed out waiting for a response and resent the
+//! same logical request) returns the *original* message's id instead of
+//! creating a second message, for as long as that original message is
+//! still somewhere in the system — pending, leased, delayed, or sitting
+//! in the DLQ. On the consumer side, every [`Claim`] carries an
+//! `idempotency_key` that's *always* present, whether or not the
+//! producer supplied one, falling back to one derived from the
+//! message's own id: a consumer that forwards this key as the
+//! idempotency key on its own downstream call (to an LLM provider's API,
+//! say) gets that provider's own idempotency handling for free, so a
+//! redelivered message that's reprocessed doesn't get executed — or
+//! billed — twice, even though this queue's own delivery guarantee is
+//! only ever at-least-once.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -45,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use qaas_types::{MessageId, Timestamp};
+use qaas_types::{IdempotencyKey, MessageId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
@@ -66,7 +84,13 @@ use crate::wal::Wal;
 /// because delivery attempts aren't durable, only messages are.
 #[derive(Serialize, Deserialize)]
 enum WalRecord<T> {
-    Enqueue(MessageId, T),
+    /// The `Option<IdempotencyKey>` is exactly what the caller passed to
+    /// `enqueue`/`enqueue_with_key` — `None` for a plain `enqueue`, never
+    /// a synthesized fallback. [`Claim::idempotency_key`] fills that
+    /// fallback in later, on demand, rather than it being stored here;
+    /// storing a derived value durably when it can always be recomputed
+    /// identically from the id would just be redundant.
+    Enqueue(MessageId, Option<IdempotencyKey>, T),
     Ack(MessageId),
 }
 
@@ -77,6 +101,7 @@ struct Pending<T> {
     /// How many times this message has already been delivered (0 if
     /// it's never been claimed).
     delivery_count: u32,
+    idempotency_key: Option<IdempotencyKey>,
 }
 
 /// A message currently out on lease to some consumer.
@@ -87,6 +112,7 @@ struct Leased<T> {
     token: LeaseToken,
     expires_at: Instant,
     delivery_count: u32,
+    idempotency_key: Option<IdempotencyKey>,
 }
 
 /// A message that failed a delivery attempt (nack or lease expiry) and
@@ -97,12 +123,23 @@ struct Delayed<T> {
     item: T,
     delivery_count: u32,
     available_at: Instant,
+    idempotency_key: Option<IdempotencyKey>,
 }
 
 struct State<T> {
     pending: VecDeque<Pending<T>>,
     leased: HashMap<MessageId, Leased<T>>,
     delayed: Vec<Delayed<T>>,
+    /// Producer-supplied idempotency keys for every message currently
+    /// somewhere in this group (pending, leased, delayed, *or* in the
+    /// DLQ — dead-lettering doesn't clear an entry here, only
+    /// [`ack`](ConsumerGroup::ack) and
+    /// [`purge_dead_letter`](ConsumerGroup::purge_dead_letter) do, since
+    /// only those mean the message is truly gone rather than just not
+    /// currently live). Only ever populated for keys a caller actually
+    /// supplied — an auto-derived fallback key is, by construction,
+    /// already unique, so dedup has nothing to check it against.
+    dedup: HashMap<IdempotencyKey, MessageId>,
 }
 
 /// Proof that a caller holds the lease it's trying to resolve.
@@ -133,6 +170,13 @@ pub struct Claim<T> {
     /// This delivery attempt's lease token — *not* stable across
     /// redeliveries. See [`LeaseToken`].
     pub token: LeaseToken,
+    /// A stable idempotency key for this message: the producer-supplied
+    /// one if `enqueue_with_key` was used, otherwise one derived from
+    /// `id`. Always present, and always the same across every
+    /// redelivery of this message — pass it as the idempotency key on a
+    /// downstream call to make that call safe against this queue's
+    /// at-least-once redelivery. See this module's docs.
+    pub idempotency_key: IdempotencyKey,
     /// The message payload.
     pub item: T,
     /// How many times this message has now been delivered, including
@@ -192,22 +236,44 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let path = path.as_ref();
         let (wal, records) = Wal::open(path).await?;
         let mut pending: VecDeque<Pending<T>> = VecDeque::new();
+        let mut dedup: HashMap<IdempotencyKey, MessageId> = HashMap::new();
         for record in records {
             match record {
-                WalRecord::Enqueue(id, item) => {
-                    pending.push_back(Pending { id, item, delivery_count: 0 });
+                WalRecord::Enqueue(id, idempotency_key, item) => {
+                    if let Some(key) = &idempotency_key {
+                        dedup.insert(key.clone(), id);
+                    }
+                    pending.push_back(Pending { id, item, delivery_count: 0, idempotency_key });
                 }
                 WalRecord::Ack(id) => {
                     if let Some(index) = pending.iter().position(|entry| entry.id == id) {
-                        pending.remove(index);
+                        if let Some(acked) = pending.remove(index) {
+                            if let Some(key) = &acked.idempotency_key {
+                                dedup.remove(key);
+                            }
+                        }
                     }
                 }
             }
         }
         let dlq = DeadLetterQueue::open(Self::dlq_path(path)).await?;
+        // Dead-lettering doesn't release a message's idempotency key —
+        // only ack and purge do (see `State::dedup`'s docs) — so a
+        // restart has to re-seed dedup with the DLQ's own keys too, not
+        // just pending's.
+        for (id, key) in dlq.ids_and_keys().await {
+            if let Some(key) = key {
+                dedup.insert(key, id);
+            }
+        }
 
         Ok(Self {
-            state: Mutex::new(State { pending, leased: HashMap::new(), delayed: Vec::new() }),
+            state: Mutex::new(State {
+                pending,
+                leased: HashMap::new(),
+                delayed: Vec::new(),
+                dedup,
+            }),
             changed: Notify::new(),
             wal,
             dlq,
@@ -225,30 +291,111 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         path.with_file_name(file_name)
     }
 
-    /// Durably enqueues `item` and returns its assigned [`MessageId`].
+    /// Durably enqueues `item`, with no idempotency key, and returns its
+    /// assigned [`MessageId`]. Every call creates a new message — for
+    /// producer-side deduplication, use
+    /// [`enqueue_with_key`](Self::enqueue_with_key) instead.
     ///
     /// # Errors
     ///
     /// Returns an error if the WAL write fails; `item` is not enqueued
     /// in that case.
     pub async fn enqueue(&self, item: T) -> io::Result<MessageId> {
-        self.enqueue_with_id(MessageId::new(), item).await
+        self.enqueue_with_id_and_key(MessageId::new(), item, None).await
     }
 
-    /// Shared by [`enqueue`](Self::enqueue) (fresh id) and
-    /// [`reprocess_dead_letter`](Self::reprocess_dead_letter) (the dead
-    /// letter's original id, so a reprocessed message stays traceable
-    /// back to what was dead-lettered).
-    async fn enqueue_with_id(&self, id: MessageId, item: T) -> io::Result<MessageId> {
-        let record = WalRecord::Enqueue(id, item);
-        self.wal.append(&record).await?;
+    /// Durably enqueues `item` under `idempotency_key`.
+    ///
+    /// If a message is already anywhere in this group (pending, leased,
+    /// delayed, or dead-lettered) under the same key, this is a no-op:
+    /// no new message is created, no WAL write happens, and the
+    /// *original* message's id is returned — exactly what a retried
+    /// enqueue call from a producer that timed out waiting for a
+    /// response needs, so its retry doesn't create a second, duplicate
+    /// message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL write fails (only possible when this
+    /// key hasn't been seen before); `item` is not enqueued in that
+    /// case, and the key is released so a later, successful enqueue with
+    /// it isn't wrongly deduplicated against a write that never actually
+    /// happened.
+    pub async fn enqueue_with_key(
+        &self,
+        item: T,
+        idempotency_key: IdempotencyKey,
+    ) -> io::Result<MessageId> {
+        self.enqueue_with_id_and_key(MessageId::new(), item, Some(idempotency_key)).await
+    }
 
-        let WalRecord::Enqueue(id, item) = record else {
+    /// Used by [`enqueue`](Self::enqueue) /
+    /// [`enqueue_with_key`](Self::enqueue_with_key) for a fresh id and
+    /// key. **Not** used by
+    /// [`reprocess_dead_letter`](Self::reprocess_dead_letter), even
+    /// though it also needs to write an `Enqueue` record for a
+    /// (non-fresh) id and key — see
+    /// [`write_enqueue_record`](Self::write_enqueue_record)'s docs for
+    /// why sharing this dedup-checking path with reprocessing would be
+    /// actively wrong, not just redundant.
+    async fn enqueue_with_id_and_key(
+        &self,
+        id: MessageId,
+        item: T,
+        idempotency_key: Option<IdempotencyKey>,
+    ) -> io::Result<MessageId> {
+        if let Some(key) = &idempotency_key {
+            let mut state = self.state.lock().await;
+            if let Some(existing_id) = state.dedup.get(key) {
+                return Ok(*existing_id);
+            }
+            // Reserve the key for `id` now, before releasing the lock —
+            // otherwise two concurrent calls with the same key could
+            // both see it as unclaimed and both go on to durably write
+            // a duplicate message, which is exactly what this method
+            // exists to prevent.
+            state.dedup.insert(key.clone(), id);
+        }
+        self.write_enqueue_record(id, item, idempotency_key).await
+    }
+
+    /// Durably writes an `Enqueue` record for `id`/`item`/`idempotency_key`
+    /// and adds the message to `pending`. No dedup check — callers that
+    /// need one ([`enqueue_with_id_and_key`](Self::enqueue_with_id_and_key))
+    /// do it themselves before calling this.
+    ///
+    /// [`reprocess_dead_letter`](Self::reprocess_dead_letter) calls this
+    /// directly rather than going through the dedup-checking path,
+    /// deliberately: dead-lettering never releases a message's
+    /// idempotency key (see `State::dedup`'s docs), so by the time
+    /// reprocessing runs, `dedup` already maps this exact key to this
+    /// exact id. Checking again here wouldn't detect a genuine
+    /// duplicate — it would just find that same pre-existing
+    /// registration and wrongly treat the reprocess itself as the
+    /// duplicate, short-circuiting before the message ever made it back
+    /// into `pending`. (This is not a hypothetical: it's a real bug this
+    /// branch shipped once and caught by actually running the tests —
+    /// see the commit history.)
+    async fn write_enqueue_record(
+        &self,
+        id: MessageId,
+        item: T,
+        idempotency_key: Option<IdempotencyKey>,
+    ) -> io::Result<MessageId> {
+        let record = WalRecord::Enqueue(id, idempotency_key.clone(), item);
+        if let Err(error) = self.wal.append(&record).await {
+            if let Some(key) = &idempotency_key {
+                self.state.lock().await.dedup.remove(key);
+            }
+            return Err(error);
+        }
+
+        let WalRecord::Enqueue(id, idempotency_key, item) = record else {
             unreachable!("record was just constructed as Enqueue")
         };
         {
             let mut state = self.state.lock().await;
-            state.pending.push_back(Pending { id, item, delivery_count: 0 });
+            state.pending.push_back(Pending { id, item, delivery_count: 0, idempotency_key });
         }
         self.changed.notify_one();
         Ok(id)
@@ -307,7 +454,9 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
             let mut state = self.state.lock().await;
             Self::promote_ready_delayed(&mut state);
 
-            if let Some(Pending { id, item, delivery_count }) = state.pending.pop_front() {
+            if let Some(Pending { id, item, delivery_count, idempotency_key }) =
+                state.pending.pop_front()
+            {
                 let delivery_count = delivery_count + 1;
                 let token = LeaseToken(self.next_lease_token.fetch_add(1, Ordering::Relaxed));
                 state.leased.insert(
@@ -317,6 +466,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                         token,
                         expires_at: Instant::now() + self.visibility_timeout,
                         delivery_count,
+                        idempotency_key: idempotency_key.clone(),
                     },
                 );
                 drop(state);
@@ -326,7 +476,8 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 // (possibly sooner) expiry immediately instead of only
                 // when its own, possibly-later, timer fires.
                 self.changed.notify_one();
-                return Claim { id, token, item, delivery_count };
+                let idempotency_key = Self::effective_idempotency_key(id, idempotency_key);
+                return Claim { id, token, idempotency_key, item, delivery_count };
             }
 
             let wake_at = Self::earliest_wake(&state);
@@ -361,12 +512,22 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     pub async fn ack(&self, id: MessageId, token: LeaseToken) -> io::Result<bool> {
         {
             let mut state = self.state.lock().await;
-            let holds_current_lease =
-                state.leased.get(&id).is_some_and(|lease| lease.token == token);
-            if !holds_current_lease {
-                return Ok(false);
+            match state.leased.remove(&id) {
+                Some(lease) if lease.token == token => {
+                    // The message is truly gone now — release its
+                    // idempotency key (if any) so a *future* enqueue
+                    // reusing it is treated as a new message, not
+                    // deduplicated against this completed one.
+                    if let Some(key) = &lease.idempotency_key {
+                        state.dedup.remove(key);
+                    }
+                }
+                Some(lease) => {
+                    state.leased.insert(id, lease);
+                    return Ok(false);
+                }
+                None => return Ok(false),
             }
-            state.leased.remove(&id);
         }
         self.wal.append(&WalRecord::Ack(id)).await?;
         Ok(true)
@@ -400,7 +561,9 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let failed_delivery = {
             let mut state = self.state.lock().await;
             match state.leased.remove(&id) {
-                Some(lease) if lease.token == token => Some((lease.item, lease.delivery_count)),
+                Some(lease) if lease.token == token => {
+                    Some((lease.item, lease.delivery_count, lease.idempotency_key))
+                }
                 // Wrong token (a stale nack for an already-redelivered
                 // message) or no lease at all — either way, put back
                 // exactly what we found, unchanged.
@@ -412,11 +575,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
             }
         };
 
-        let Some((item, delivery_count)) = failed_delivery else {
+        let Some((item, delivery_count, idempotency_key)) = failed_delivery else {
             return Ok(false);
         };
 
-        self.resolve_failed_delivery(id, item, delivery_count, reason).await?;
+        self.resolve_failed_delivery(id, item, delivery_count, idempotency_key, reason).await?;
         self.changed.notify_one();
         Ok(true)
     }
@@ -445,7 +608,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// and a caller blocked in `claim` shouldn't fail because a
     /// different message's DLQ write happened to fail.
     async fn reclaim_expired_leases(&self) {
-        let expired: Vec<(MessageId, T, u32)> = {
+        let expired: Vec<(MessageId, T, u32, Option<IdempotencyKey>)> = {
             let mut state = self.state.lock().await;
             let now = Instant::now();
             let expired_ids: Vec<MessageId> = state
@@ -459,7 +622,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 .map(|id| {
                     let lease =
                         state.leased.remove(&id).expect("id came from iterating this same map");
-                    (id, lease.item, lease.delivery_count)
+                    (id, lease.item, lease.delivery_count, lease.idempotency_key)
                 })
                 .collect()
         };
@@ -467,9 +630,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         if expired.is_empty() {
             return;
         }
-        for (id, item, delivery_count) in expired {
+        for (id, item, delivery_count, idempotency_key) in expired {
             let reason = Some("visibility timeout expired".to_string());
-            if let Err(error) = self.resolve_failed_delivery(id, item, delivery_count, reason).await
+            if let Err(error) = self
+                .resolve_failed_delivery(id, item, delivery_count, idempotency_key, reason)
+                .await
             {
                 tracing::error!(
                     %error,
@@ -507,12 +672,14 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         id: MessageId,
         item: T,
         delivery_count: u32,
+        idempotency_key: Option<IdempotencyKey>,
         reason: Option<String>,
     ) -> io::Result<()> {
         if self.retry_policy.is_exhausted(delivery_count) {
             self.dlq
                 .record(DeadLetter {
                     id,
+                    idempotency_key,
                     item,
                     delivery_count,
                     last_error: reason,
@@ -527,6 +694,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 item,
                 delivery_count,
                 available_at: Instant::now() + delay,
+                idempotency_key,
             });
             Ok(())
         }
@@ -549,6 +717,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                     id: entry.id,
                     item: entry.item,
                     delivery_count: entry.delivery_count,
+                    idempotency_key: entry.idempotency_key,
                 });
             } else {
                 still_delayed.push(entry);
@@ -565,6 +734,19 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let earliest_lease_expiry = state.leased.values().map(|lease| lease.expires_at).min();
         let earliest_retry = state.delayed.iter().map(|entry| entry.available_at).min();
         [earliest_lease_expiry, earliest_retry].into_iter().flatten().min()
+    }
+
+    /// The idempotency key a [`Claim`] should carry: `explicit` if the
+    /// producer supplied one, otherwise one derived from `id` — a UUID's
+    /// string form is never empty, so this can't fail the way a
+    /// caller-supplied string might have to be validated against.
+    fn effective_idempotency_key(
+        id: MessageId,
+        explicit: Option<IdempotencyKey>,
+    ) -> IdempotencyKey {
+        explicit.unwrap_or_else(|| {
+            IdempotencyKey::new(id.to_string()).expect("a UUID's string form is never empty")
+        })
     }
 
     /// Every message currently sitting in this group's dead-letter
@@ -593,19 +775,31 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let Some(dead_letter) = self.dlq.take(id).await? else {
             return Ok(false);
         };
-        self.enqueue_with_id(dead_letter.id, dead_letter.item).await?;
+        // Deliberately not enqueue_with_id_and_key — see
+        // write_enqueue_record's docs for why going through the
+        // dedup-checking path here would wrongly no-op the reprocess.
+        self.write_enqueue_record(dead_letter.id, dead_letter.item, dead_letter.idempotency_key)
+            .await?;
         Ok(true)
     }
 
     /// Permanently discards the dead letter with `id` — it will not be
-    /// reprocessed. Returns `Ok(false)` if no dead letter with `id`
-    /// exists.
+    /// reprocessed. Its idempotency key (if any) is released, so a
+    /// future enqueue reusing it is treated as a new message rather than
+    /// deduplicated against the discarded one. Returns `Ok(false)` if no
+    /// dead letter with `id` exists.
     ///
     /// # Errors
     ///
     /// Returns an error if the DLQ's WAL write fails.
     pub async fn purge_dead_letter(&self, id: MessageId) -> io::Result<bool> {
-        Ok(self.dlq.take(id).await?.is_some())
+        let Some(dead_letter) = self.dlq.take(id).await? else {
+            return Ok(false);
+        };
+        if let Some(key) = &dead_letter.idempotency_key {
+            self.state.lock().await.dedup.remove(key);
+        }
+        Ok(true)
     }
 }
 
@@ -1001,16 +1195,23 @@ mod tests {
         // rather than becoming claimable again — every one of these
         // calls is expected to time out with nothing to claim.
         //
-        // The 200ms bound is deliberate, not arbitrary: dead-lettering
-        // does a real fsync (~tens of ms in this environment — see
-        // Wal's docs on the durability-over-throughput tradeoff), and
-        // claim's own docs warn that a timeout shorter than that risks
-        // cancelling the write mid-flight and losing the message. A
-        // tighter bound here would flakily reproduce exactly that, not
-        // exercise the behavior this test is actually checking.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The inner bound is deliberately generous, not tight: dead-
+        // lettering does a real fsync (~tens of ms in this environment
+        // in isolation — see Wal's docs on the durability-over-
+        // throughput tradeoff — but observably over 200ms under the
+        // contention of the full suite running in parallel, which
+        // caused exactly the flake this comment now warns against). And
+        // claim's own docs warn that a timeout shorter than the actual
+        // write latency risks cancelling it mid-flight and losing the
+        // message — a tight bound here wouldn't just be flaky, it would
+        // flakily reproduce that documented edge case instead of
+        // exercising the behavior this test is actually checking. 1s
+        // comfortably covers realistic contention; the 15s outer bound
+        // gives room for several such inner cycles before this is
+        // treated as a genuine hang rather than just slow.
+        tokio::time::timeout(Duration::from_secs(15), async {
             while group.dead_letters().await.is_empty() {
-                let _ = tokio::time::timeout(Duration::from_millis(200), group.claim()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(1), group.claim()).await;
             }
         })
         .await
@@ -1076,5 +1277,180 @@ mod tests {
 
         assert!(!group.reprocess_dead_letter(bogus_id).await.unwrap());
         assert!(!group.purge_dead_letter(bogus_id).await.unwrap());
+    }
+
+    fn key(s: &str) -> qaas_types::IdempotencyKey {
+        qaas_types::IdempotencyKey::new(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_retried_enqueue_with_the_same_key_returns_the_original_id_not_a_duplicate() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+
+        let first_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        let second_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(group.len().await, 1, "a retried enqueue must not create a second message");
+    }
+
+    #[tokio::test]
+    async fn different_keys_create_separate_messages() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+
+        let a = group.enqueue_with_key(1, key("a")).await.unwrap();
+        let b = group.enqueue_with_key(2, key("b")).await.unwrap();
+
+        assert_ne!(a, b);
+        assert_eq!(group.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_claim_always_has_an_idempotency_key_even_without_one_from_the_producer() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let claim = group.claim().await;
+        assert_eq!(claim.idempotency_key, key(&claim.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_producer_supplied_key_is_what_the_claim_carries() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue_with_key(1, key("order-42")).await.unwrap();
+
+        let claim = group.claim().await;
+        assert_eq!(claim.idempotency_key, key("order-42"));
+    }
+
+    #[tokio::test]
+    async fn the_idempotency_key_is_identical_across_a_redelivery() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, SHORT_TIMEOUT).await;
+        group.enqueue_with_key(1, key("order-42")).await.unwrap();
+
+        let first = group.claim().await;
+        let second = tokio::time::timeout(Duration::from_secs(5), group.claim()).await.unwrap();
+
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert_eq!(second.idempotency_key, key("order-42"));
+    }
+
+    #[tokio::test]
+    async fn acking_releases_the_key_so_a_later_enqueue_can_reuse_it() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+
+        let first_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        let claim = group.claim().await;
+        assert!(group.ack(claim.id, claim.token).await.unwrap());
+
+        // Not a retry of the same logical operation any more, as far as
+        // this group is concerned — acking means it's done — so a new
+        // enqueue with the same key is a genuinely new message.
+        let second_id = group.enqueue_with_key(2, key("order-42")).await.unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(group.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn dead_lettering_does_not_release_the_key_but_purging_does() {
+        let dir = tempdir().unwrap();
+        let group =
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap();
+
+        let first_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        let first = group.claim().await;
+        group.nack(first.id, first.token, None).await.unwrap();
+        let second = group.claim().await;
+        group.nack(second.id, second.token, None).await.unwrap();
+        assert_eq!(group.dead_letters().await.len(), 1);
+
+        // Still dead-lettered, not gone — a retried enqueue with the
+        // same key must still resolve to it, not create a fresh
+        // duplicate that would also just end up exhausted.
+        let retried_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        assert_eq!(retried_id, first_id);
+        assert_eq!(group.dead_letters().await.len(), 1, "must not have created a duplicate");
+
+        assert!(group.purge_dead_letter(first_id).await.unwrap());
+        // Now genuinely gone — a new enqueue with the same key is a new
+        // message.
+        let fresh_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        assert_ne!(fresh_id, first_id);
+    }
+
+    #[tokio::test]
+    async fn reprocessing_keeps_the_key_registered_against_the_reprocessed_message() {
+        let dir = tempdir().unwrap();
+        let group =
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap();
+
+        let original_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        let first = group.claim().await;
+        group.nack(first.id, first.token, None).await.unwrap();
+        let second = group.claim().await;
+        group.nack(second.id, second.token, None).await.unwrap();
+
+        assert!(group.reprocess_dead_letter(original_id).await.unwrap());
+
+        // A retried enqueue now resolves to the reprocessed (live again)
+        // message, not a new one.
+        let retried_id = group.enqueue_with_key(1, key("order-42")).await.unwrap();
+        assert_eq!(retried_id, original_id);
+        assert_eq!(group.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn dedup_survives_reopening_the_same_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let original_id = {
+            let group =
+                ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
+            group.enqueue_with_key(1, key("order-42")).await.unwrap()
+        };
+
+        let recovered =
+            ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
+        let retried_id = recovered.enqueue_with_key(2, key("order-42")).await.unwrap();
+
+        assert_eq!(
+            retried_id, original_id,
+            "a producer retry after a restart must still be deduplicated"
+        );
+        assert_eq!(recovered.len().await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_enqueues_with_the_same_key_produce_exactly_one_message() {
+        let dir = tempdir().unwrap();
+        let group = Arc::new(open(&dir, LONG_TIMEOUT).await);
+
+        let mut attempts = Vec::new();
+        for i in 0..16 {
+            let group = Arc::clone(&group);
+            attempts.push(tokio::spawn(async move {
+                group.enqueue_with_key(i, key("order-42")).await.unwrap()
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for attempt in attempts {
+            ids.push(attempt.await.unwrap());
+        }
+
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 1, "every concurrent attempt must resolve to the same single id");
+        assert_eq!(group.len().await, 1);
     }
 }
