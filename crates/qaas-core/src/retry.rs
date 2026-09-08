@@ -10,15 +10,17 @@
 //! many messages failing at once don't all become claimable again at
 //! the same synchronized instant.
 //!
-//! Deliberately out of scope here: a maximum-attempts cutoff or routing
-//! to a dead-letter destination once retries are exhausted. This policy
-//! backs off forever — `feature/dead-letter-queue` is where "and after N
-//! failures, give up" gets decided.
+//! Also decides, via `max_attempts`, when a message has failed enough
+//! times to stop retrying altogether — `feature/dead-letter-queue`
+//! builds on that to route an exhausted message to a
+//! [`DeadLetterQueue`](crate::dead_letter::DeadLetterQueue) instead of
+//! backing it off forever.
 
 use std::time::Duration;
 
 /// Exponential backoff with jitter, applied before a failed or expired
-/// delivery becomes claimable again.
+/// delivery becomes claimable again — and the point at which a message
+/// stops being retried at all.
 ///
 /// The delay before retry `n` (the `n`-th failure, 1-indexed) is
 /// `base_delay * multiplier^(n-1)`, capped at `max_delay`, then
@@ -38,6 +40,12 @@ pub struct RetryPolicy {
     /// Fraction of the capped delay to randomize away, in `0.0..=1.0`.
     /// See this type's docs for the exact interpretation.
     pub jitter: f64,
+    /// The total number of delivery attempts (not retries — the first
+    /// attempt counts) allowed before a message is considered exhausted
+    /// and should be dead-lettered instead of retried again. `None`
+    /// means retry forever, matching this type's behavior before
+    /// `max_attempts` existed.
+    pub max_attempts: Option<u32>,
 }
 
 /// Exponents beyond this are never reached in practice — any reasonable
@@ -50,12 +58,14 @@ const MAX_BACKOFF_EXPONENT: u32 = 32;
 
 impl RetryPolicy {
     /// A reasonable default: 500ms base delay, doubling each time, capped
-    /// at 60 seconds, with 20% jitter.
+    /// at 60 seconds, with 20% jitter, giving up after 5 total delivery
+    /// attempts.
     pub const DEFAULT: Self = Self {
         base_delay: Duration::from_millis(500),
         max_delay: Duration::from_secs(60),
         multiplier: 2.0,
         jitter: 0.2,
+        max_attempts: Some(5),
     };
 
     /// The delay to wait before a message that has now failed
@@ -65,7 +75,10 @@ impl RetryPolicy {
     ///
     /// `delivery_count == 0` is treated the same as `1` — there's no
     /// such thing as backing off before the first delivery, which
-    /// hasn't failed yet.
+    /// hasn't failed yet. Meaningless to call once
+    /// [`is_exhausted`](Self::is_exhausted) is true for the same count —
+    /// nothing calls this for a message that's being dead-lettered
+    /// instead of retried.
     #[must_use]
     pub fn delay_for(&self, delivery_count: u32) -> Duration {
         let exponent = delivery_count.saturating_sub(1).min(MAX_BACKOFF_EXPONENT);
@@ -79,6 +92,14 @@ impl RetryPolicy {
         let jittered_secs = apply_jitter(capped_secs, self.jitter);
 
         Duration::from_secs_f64(jittered_secs.max(0.0))
+    }
+
+    /// Whether a message that has now failed `delivery_count` times has
+    /// used up its allowed attempts and should be dead-lettered instead
+    /// of retried again. Always `false` when `max_attempts` is `None`.
+    #[must_use]
+    pub fn is_exhausted(&self, delivery_count: u32) -> bool {
+        self.max_attempts.is_some_and(|max_attempts| delivery_count >= max_attempts)
     }
 }
 
@@ -116,6 +137,7 @@ mod tests {
             max_delay: Duration::from_secs(3600),
             multiplier: 2.0,
             jitter: 0.0,
+            max_attempts: None,
         };
         assert_eq!(policy.delay_for(1), Duration::from_millis(100));
         assert_eq!(policy.delay_for(2), Duration::from_millis(200));
@@ -130,6 +152,7 @@ mod tests {
             max_delay: Duration::from_secs(5),
             multiplier: 2.0,
             jitter: 0.0,
+            max_attempts: None,
         };
         assert_eq!(policy.delay_for(10), Duration::from_secs(5));
         assert_eq!(policy.delay_for(1000), Duration::from_secs(5));
@@ -149,6 +172,7 @@ mod tests {
             max_delay: Duration::from_secs(3600),
             multiplier: 1.0,
             jitter: 0.5,
+            max_attempts: None,
         };
         for _ in 0..200 {
             let delay = policy.delay_for(1);
@@ -164,6 +188,7 @@ mod tests {
             max_delay: Duration::from_secs(3600),
             multiplier: 1.0,
             jitter: 1.0,
+            max_attempts: None,
         };
         // Not a proof, but 500 samples landing under 100ms with a
         // uniform draw over [0, 1000ms) is astronomically likely to
@@ -181,5 +206,21 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(policy.delay_for(3), first);
         }
+    }
+
+    #[test]
+    fn no_max_attempts_is_never_exhausted() {
+        let policy = RetryPolicy { max_attempts: None, ..RetryPolicy::DEFAULT };
+        assert!(!policy.is_exhausted(1));
+        assert!(!policy.is_exhausted(1_000_000));
+    }
+
+    #[test]
+    fn exhausted_exactly_at_max_attempts_not_one_before() {
+        let policy = RetryPolicy { max_attempts: Some(3), ..RetryPolicy::DEFAULT };
+        assert!(!policy.is_exhausted(1));
+        assert!(!policy.is_exhausted(2));
+        assert!(policy.is_exhausted(3));
+        assert!(policy.is_exhausted(4));
     }
 }

@@ -31,18 +31,26 @@
 //! loop — exactly the thundering-herd behavior this module exists to
 //! prevent, just triggered by explicit failure signaling instead of
 //! silent timeouts.
+//!
+//! Backoff isn't forever, though: once `retry_policy` considers a
+//! message's `delivery_count` exhausted, a nack or expiry routes it to
+//! this group's [`DeadLetterQueue`] instead of scheduling yet another
+//! retry — durably, with the failure reason attached, so an operator (or
+//! `feature/llm-assisted-dlq-triage`, later) has somewhere to look
+//! instead of the message just disappearing.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use qaas_types::MessageId;
+use qaas_types::{MessageId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
+use crate::dead_letter::{DeadLetter, DeadLetterQueue};
 use crate::retry::RetryPolicy;
 use crate::wal::Wal;
 
@@ -147,6 +155,7 @@ pub struct ConsumerGroup<T> {
     /// of waiting out a timer it no longer needs to.
     changed: Notify,
     wal: Wal<WalRecord<T>>,
+    dlq: DeadLetterQueue<T>,
     visibility_timeout: Duration,
     retry_policy: RetryPolicy,
     next_lease_token: AtomicU64,
@@ -163,15 +172,24 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// and `retry_policy` to every nack or lease expiry; neither has a
     /// per-claim or per-message override in this branch.
     ///
+    /// This group's dead-letter queue lives alongside `path`: if `path`
+    /// is `"orders.wal"`, the DLQ's own WAL is `"orders.wal.dlq"` in the
+    /// same directory. Deriving it rather than taking a second `path`
+    /// argument keeps this constructor's signature from growing every
+    /// time this group gains another durable side-structure, and there's
+    /// no use case yet for a DLQ shared across multiple groups that
+    /// would need it passed in independently.
+    ///
     /// # Errors
     ///
     /// Returns an error under the same conditions as
-    /// [`Wal::open`](crate::wal::Wal::open).
+    /// [`Wal::open`](crate::wal::Wal::open), for either WAL.
     pub async fn open(
         path: impl AsRef<Path>,
         visibility_timeout: Duration,
         retry_policy: RetryPolicy,
     ) -> io::Result<Self> {
+        let path = path.as_ref();
         let (wal, records) = Wal::open(path).await?;
         let mut pending: VecDeque<Pending<T>> = VecDeque::new();
         for record in records {
@@ -186,15 +204,25 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 }
             }
         }
+        let dlq = DeadLetterQueue::open(Self::dlq_path(path)).await?;
 
         Ok(Self {
             state: Mutex::new(State { pending, leased: HashMap::new(), delayed: Vec::new() }),
             changed: Notify::new(),
             wal,
+            dlq,
             visibility_timeout,
             retry_policy,
             next_lease_token: AtomicU64::new(0),
         })
+    }
+
+    /// See [`open`](Self::open)'s docs for why this is derived rather
+    /// than a separate constructor argument.
+    fn dlq_path(path: &Path) -> PathBuf {
+        let mut file_name = path.file_name().unwrap_or_default().to_os_string();
+        file_name.push(".dlq");
+        path.with_file_name(file_name)
     }
 
     /// Durably enqueues `item` and returns its assigned [`MessageId`].
@@ -204,7 +232,14 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// Returns an error if the WAL write fails; `item` is not enqueued
     /// in that case.
     pub async fn enqueue(&self, item: T) -> io::Result<MessageId> {
-        let id = MessageId::new();
+        self.enqueue_with_id(MessageId::new(), item).await
+    }
+
+    /// Shared by [`enqueue`](Self::enqueue) (fresh id) and
+    /// [`reprocess_dead_letter`](Self::reprocess_dead_letter) (the dead
+    /// letter's original id, so a reprocessed message stays traceable
+    /// back to what was dead-lettered).
+    async fn enqueue_with_id(&self, id: MessageId, item: T) -> io::Result<MessageId> {
         let record = WalRecord::Enqueue(id, item);
         self.wal.append(&record).await?;
 
@@ -242,13 +277,34 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// without either cloning or handing back a borrow tied to an
     /// internal lock, and the latter doesn't compose with an
     /// independently-resolved `ack`/`nack` call.
+    ///
+    /// # A note on wrapping this in an external timeout
+    ///
+    /// Doing so (`tokio::time::timeout(d, group.claim())`) is a
+    /// reasonable way to poll with a bounded wait, but be generous with
+    /// `d`: this call may need to reclaim an expired lease as a side
+    /// effect of finding you something to claim, and if that reclaim
+    /// turns out to mean dead-lettering a different, unrelated message
+    /// (see the module docs), that's a real, fsync-backed WAL write.
+    /// Cancelling `claim` — by dropping a `timeout` future once it
+    /// elapses — mid-write does not roll that write back; it can lose
+    /// the message being dead-lettered. Prefer a timeout comfortably
+    /// longer than this group's WAL write latency (milliseconds to tens
+    /// of milliseconds, typically) over an aggressive one.
     pub async fn claim(&self) -> Claim<T>
     where
         T: Clone,
     {
         loop {
+            // Resolving an expired lease can now mean dead-lettering it
+            // (durable DLQ I/O), so this can't run as a plain sync
+            // helper under the state lock any more — it does its own
+            // locking internally instead, in short critical sections,
+            // never holding the lock across the `.await` inside
+            // `resolve_failed_delivery`.
+            self.reclaim_expired_leases().await;
+
             let mut state = self.state.lock().await;
-            self.reclaim_expired_leases(&mut state);
             Self::promote_ready_delayed(&mut state);
 
             if let Some(Pending { id, item, delivery_count }) = state.pending.pop_front() {
@@ -317,58 +373,110 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     }
 
     /// Releases a claimed message back to the retry pool immediately —
-    /// as opposed to waiting for its lease to expire on its own — where
-    /// it waits out this group's [`RetryPolicy`] backoff before becoming
+    /// as opposed to waiting for its lease to expire on its own — with
+    /// `reason` recorded if this delivery is the one that ends up
+    /// exhausting the retry policy, in which case it's dead-lettered
+    /// instead of scheduled again (see this module's docs). Otherwise it
+    /// waits out this group's [`RetryPolicy`] backoff before becoming
     /// claimable again, exactly as an expired lease would.
     ///
-    /// Same stale-lease handling as [`ack`](Self::ack): returns `false`
-    /// without effect if `id`/`token` don't match a currently-active
-    /// lease. No WAL write here — nack doesn't durably commit anything,
-    /// it only changes which in-memory pool the message sits in.
-    pub async fn nack(&self, id: MessageId, token: LeaseToken) -> bool {
-        let requeued = {
+    /// Same stale-lease handling as [`ack`](Self::ack): returns
+    /// `Ok(false)` without effect if `id`/`token` don't match a
+    /// currently-active lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this delivery turns out to be the one that
+    /// exhausts the retry policy and the resulting dead-letter WAL write
+    /// fails. A nack that doesn't exhaust the policy never does I/O and
+    /// can't fail this way — scheduling a retry is purely an in-memory
+    /// operation.
+    pub async fn nack(
+        &self,
+        id: MessageId,
+        token: LeaseToken,
+        reason: Option<String>,
+    ) -> io::Result<bool> {
+        let failed_delivery = {
             let mut state = self.state.lock().await;
             match state.leased.remove(&id) {
-                Some(lease) if lease.token == token => {
-                    self.schedule_retry(&mut state, id, lease.item, lease.delivery_count);
-                    true
-                }
+                Some(lease) if lease.token == token => Some((lease.item, lease.delivery_count)),
                 // Wrong token (a stale nack for an already-redelivered
                 // message) or no lease at all — either way, put back
                 // exactly what we found, unchanged.
                 Some(lease) => {
                     state.leased.insert(id, lease);
-                    false
+                    None
                 }
-                None => false,
+                None => None,
             }
         };
-        if requeued {
-            self.changed.notify_one();
-        }
-        requeued
+
+        let Some((item, delivery_count)) = failed_delivery else {
+            return Ok(false);
+        };
+
+        self.resolve_failed_delivery(id, item, delivery_count, reason).await?;
+        self.changed.notify_one();
+        Ok(true)
     }
 
-    /// Moves every lease whose visibility timeout has passed into the
-    /// retry backoff pool (see [`schedule_retry`](Self::schedule_retry)).
-    /// Called at the start of every [`claim`](Self::claim), so a
-    /// consumer can never observe a message as permanently unclaimable
+    /// Moves every lease whose visibility timeout has passed to
+    /// [`resolve_failed_delivery`](Self::resolve_failed_delivery), with a
+    /// synthetic failure reason since there was no consumer around to
+    /// give one. Called at the start of every [`claim`](Self::claim), so
+    /// a consumer can never observe a message as permanently unclaimable
     /// purely because its previous lease-holder crashed.
-    fn reclaim_expired_leases(&self, state: &mut State<T>) {
-        let now = Instant::now();
-        let expired: Vec<MessageId> = state
-            .leased
-            .iter()
-            .filter(|(_, lease)| lease.expires_at <= now)
-            .map(|(id, _)| *id)
-            .collect();
+    ///
+    /// There's no background sweeper — this only ever runs as a side
+    /// effect of some caller calling `claim`. An expired lease whose
+    /// retry policy is now exhausted sits un-dead-lettered, and
+    /// [`dead_letters`](Self::dead_letters) won't show it, until
+    /// something calls `claim` again, even if that call has nothing else
+    /// to do and blocks afterward. In practice this is rarely
+    /// observable — a group with no consumers calling `claim` has no one
+    /// waiting on the outcome either — but it means "when exactly does a
+    /// message get dead-lettered" isn't purely a function of time
+    /// elapsed.
+    ///
+    /// Any error dead-lettering an expired lease is logged rather than
+    /// propagated — `claim` has no way to surface an error about some
+    /// *other*, unrelated message than the one it's trying to return,
+    /// and a caller blocked in `claim` shouldn't fail because a
+    /// different message's DLQ write happened to fail.
+    async fn reclaim_expired_leases(&self) {
+        let expired: Vec<(MessageId, T, u32)> = {
+            let mut state = self.state.lock().await;
+            let now = Instant::now();
+            let expired_ids: Vec<MessageId> = state
+                .leased
+                .iter()
+                .filter(|(_, lease)| lease.expires_at <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            expired_ids
+                .into_iter()
+                .map(|id| {
+                    let lease =
+                        state.leased.remove(&id).expect("id came from iterating this same map");
+                    (id, lease.item, lease.delivery_count)
+                })
+                .collect()
+        };
 
         if expired.is_empty() {
             return;
         }
-        for id in expired {
-            let lease = state.leased.remove(&id).expect("id came from iterating this same map");
-            self.schedule_retry(state, id, lease.item, lease.delivery_count);
+        for (id, item, delivery_count) in expired {
+            let reason = Some("visibility timeout expired".to_string());
+            if let Err(error) = self.resolve_failed_delivery(id, item, delivery_count, reason).await
+            {
+                tracing::error!(
+                    %error,
+                    message_id = %id,
+                    "failed to dead-letter an expired lease; message may be lost"
+                );
+            }
         }
         // Multiple messages may have just become claimable (or had their
         // next-wake time change) at once — wake every blocked claimer to
@@ -376,20 +484,52 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         self.changed.notify_waiters();
     }
 
-    /// Puts a failed delivery into the backoff pool rather than directly
-    /// back into `pending`, per this group's [`RetryPolicy`]. Shared by
-    /// [`nack`](Self::nack) and [`reclaim_expired_leases`](Self::reclaim_expired_leases) —
-    /// a lease expiry and an explicit nack both mean "this delivery
-    /// attempt failed," and both need the same backoff treatment to
-    /// avoid the thundering-herd behavior this module exists to prevent.
-    fn schedule_retry(&self, state: &mut State<T>, id: MessageId, item: T, delivery_count: u32) {
-        let delay = self.retry_policy.delay_for(delivery_count);
-        state.delayed.push(Delayed {
-            id,
-            item,
-            delivery_count,
-            available_at: Instant::now() + delay,
-        });
+    /// The common resolution for any failed delivery attempt (nack or
+    /// expired lease): dead-letters `item` if `retry_policy` now
+    /// considers `delivery_count` exhausted, otherwise schedules it for
+    /// another attempt after the policy's backoff delay.
+    ///
+    /// Takes no lock itself before deciding which path to take — the
+    /// dead-letter path does DLQ I/O, and this crate's rule is to never
+    /// hold the state lock across an `.await`. If that DLQ write fails,
+    /// `item` is lost rather than retried — the same "a failed durable
+    /// write loses whatever it was writing" behavior every other
+    /// WAL-backed operation in this crate already has (`enqueue`,
+    /// `ack`), not a special case invented here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only along the dead-letter path, if the DLQ's
+    /// WAL write fails. Scheduling a retry is in-memory only and never
+    /// fails.
+    async fn resolve_failed_delivery(
+        &self,
+        id: MessageId,
+        item: T,
+        delivery_count: u32,
+        reason: Option<String>,
+    ) -> io::Result<()> {
+        if self.retry_policy.is_exhausted(delivery_count) {
+            self.dlq
+                .record(DeadLetter {
+                    id,
+                    item,
+                    delivery_count,
+                    last_error: reason,
+                    dead_lettered_at: Timestamp::now(),
+                })
+                .await
+        } else {
+            let delay = self.retry_policy.delay_for(delivery_count);
+            let mut state = self.state.lock().await;
+            state.delayed.push(Delayed {
+                id,
+                item,
+                delivery_count,
+                available_at: Instant::now() + delay,
+            });
+            Ok(())
+        }
     }
 
     /// Moves every delayed message whose backoff has elapsed into
@@ -426,6 +566,47 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let earliest_retry = state.delayed.iter().map(|entry| entry.available_at).min();
         [earliest_lease_expiry, earliest_retry].into_iter().flatten().min()
     }
+
+    /// Every message currently sitting in this group's dead-letter
+    /// queue, in no particular order.
+    pub async fn dead_letters(&self) -> Vec<DeadLetter<T>>
+    where
+        T: Clone,
+    {
+        self.dlq.list().await
+    }
+
+    /// Takes the dead letter with `id` out of the DLQ and durably
+    /// re-enqueues it into this group's live queue — at the back, as a
+    /// fresh delivery cycle (`delivery_count` starts over at 0), but
+    /// keeping its original [`MessageId`] so it stays traceable across
+    /// the round trip through the DLQ.
+    ///
+    /// Returns `Ok(false)` if no dead letter with `id` exists — already
+    /// reprocessed, already purged, or never dead-lettered at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either WAL write fails (removing it from the
+    /// DLQ, or re-enqueueing it into the live queue).
+    pub async fn reprocess_dead_letter(&self, id: MessageId) -> io::Result<bool> {
+        let Some(dead_letter) = self.dlq.take(id).await? else {
+            return Ok(false);
+        };
+        self.enqueue_with_id(dead_letter.id, dead_letter.item).await?;
+        Ok(true)
+    }
+
+    /// Permanently discards the dead letter with `id` — it will not be
+    /// reprocessed. Returns `Ok(false)` if no dead letter with `id`
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DLQ's WAL write fails.
+    pub async fn purge_dead_letter(&self, id: MessageId) -> io::Result<bool> {
+        Ok(self.dlq.take(id).await?.is_some())
+    }
 }
 
 #[cfg(test)]
@@ -455,6 +636,7 @@ mod tests {
         max_delay: Duration::ZERO,
         multiplier: 1.0,
         jitter: 0.0,
+        max_attempts: None,
     };
 
     async fn open(dir: &tempfile::TempDir, visibility_timeout: Duration) -> ConsumerGroup<i32> {
@@ -520,6 +702,7 @@ mod tests {
             max_delay: Duration::from_millis(60),
             multiplier: 1.0,
             jitter: 0.0,
+            max_attempts: None,
         };
         let dir = tempdir().unwrap();
         let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), SHORT_TIMEOUT, policy)
@@ -552,6 +735,7 @@ mod tests {
             max_delay: Duration::from_secs(60),
             multiplier: 1.0,
             jitter: 0.0,
+            max_attempts: None,
         };
         let dir = tempdir().unwrap();
         let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, policy)
@@ -560,7 +744,7 @@ mod tests {
         group.enqueue(1).await.unwrap();
 
         let claim = group.claim().await;
-        assert!(group.nack(claim.id, claim.token).await);
+        assert!(group.nack(claim.id, claim.token, None).await.unwrap());
 
         // The message is now sitting in the delayed pool (a 60s backoff,
         // far longer than this test runs) rather than pending or leased
@@ -582,6 +766,7 @@ mod tests {
             max_delay: Duration::from_millis(60),
             multiplier: 1.0,
             jitter: 0.0,
+            max_attempts: None,
         };
         let dir = tempdir().unwrap();
         let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, policy)
@@ -590,7 +775,9 @@ mod tests {
         group.enqueue(1).await.unwrap();
 
         let first = group.claim().await;
-        assert!(group.nack(first.id, first.token).await);
+        assert!(
+            group.nack(first.id, first.token, Some("downstream 429".to_string())).await.unwrap()
+        );
 
         // Not instant: still within the retry delay, so nothing should
         // be claimable yet.
@@ -637,7 +824,7 @@ mod tests {
         let first = group.claim().await;
         let _second = tokio::time::timeout(Duration::from_secs(5), group.claim()).await.unwrap();
 
-        assert!(!group.nack(first.id, first.token).await);
+        assert!(!group.nack(first.id, first.token, None).await.unwrap());
     }
 
     #[tokio::test]
@@ -747,5 +934,147 @@ mod tests {
         all_received.sort_unstable();
         all_received.dedup();
         assert_eq!(all_received.len(), TOTAL);
+    }
+
+    /// Zero delay (so these tests run fast) but a real `max_attempts`,
+    /// so a message dead-letters on its second failed delivery.
+    const EXHAUST_AFTER_TWO: RetryPolicy = RetryPolicy {
+        base_delay: Duration::ZERO,
+        max_delay: Duration::ZERO,
+        multiplier: 1.0,
+        jitter: 0.0,
+        max_attempts: Some(2),
+    };
+
+    #[tokio::test]
+    async fn nacking_past_max_attempts_dead_letters_the_message_with_its_last_reason() {
+        let dir = tempdir().unwrap();
+        let group =
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap();
+        group.enqueue(42).await.unwrap();
+
+        let first = group.claim().await;
+        assert_eq!(first.delivery_count, 1);
+        assert!(
+            group.nack(first.id, first.token, Some("first failure".to_string())).await.unwrap()
+        );
+
+        // Not exhausted yet (1 < 2): back in the live queue, not the DLQ.
+        assert!(group.dead_letters().await.is_empty());
+
+        let second = group.claim().await;
+        assert_eq!(second.delivery_count, 2);
+        assert!(
+            group.nack(second.id, second.token, Some("second failure".to_string())).await.unwrap()
+        );
+
+        // Exhausted now (2 >= 2): gone from the live queue, present in
+        // the DLQ with the reason from this last failure.
+        assert!(group.is_empty().await);
+        let dead_letters = group.dead_letters().await;
+        assert_eq!(dead_letters.len(), 1);
+        assert_eq!(dead_letters[0].id, first.id);
+        assert_eq!(dead_letters[0].item, 42);
+        assert_eq!(dead_letters[0].delivery_count, 2);
+        assert_eq!(dead_letters[0].last_error.as_deref(), Some("second failure"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_that_exhausts_retries_is_dead_lettered_with_a_synthetic_reason() {
+        let policy = RetryPolicy { max_attempts: Some(1), ..EXHAUST_AFTER_TWO };
+        let dir = tempdir().unwrap();
+        let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), SHORT_TIMEOUT, policy)
+            .await
+            .unwrap();
+        group.enqueue(1).await.unwrap();
+
+        let _first = group.claim().await; // delivery_count 1; never acked or nacked
+
+        // Lease expiry is only reclaimed as a side effect of something
+        // calling `claim` — there's no background sweeper — so polling
+        // `dead_letters` alone would hang forever. Bounded `claim` calls
+        // both drive that reclaim sweep and double as the timeout: once
+        // max_attempts is 1, the single failed delivery is already
+        // exhausted, so this expired lease goes straight to the DLQ
+        // rather than becoming claimable again — every one of these
+        // calls is expected to time out with nothing to claim.
+        //
+        // The 200ms bound is deliberate, not arbitrary: dead-lettering
+        // does a real fsync (~tens of ms in this environment — see
+        // Wal's docs on the durability-over-throughput tradeoff), and
+        // claim's own docs warn that a timeout shorter than that risks
+        // cancelling the write mid-flight and losing the message. A
+        // tighter bound here would flakily reproduce exactly that, not
+        // exercise the behavior this test is actually checking.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while group.dead_letters().await.is_empty() {
+                let _ = tokio::time::timeout(Duration::from_millis(200), group.claim()).await;
+            }
+        })
+        .await
+        .expect("expired lease should have been dead-lettered");
+
+        assert!(group.is_empty().await);
+        let dead_letters = group.dead_letters().await;
+        assert_eq!(dead_letters[0].last_error.as_deref(), Some("visibility timeout expired"));
+    }
+
+    #[tokio::test]
+    async fn reprocessing_a_dead_letter_returns_it_to_the_live_queue_with_a_fresh_delivery_count() {
+        let dir = tempdir().unwrap();
+        let group =
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap();
+        group.enqueue(7).await.unwrap();
+
+        let first = group.claim().await;
+        group.nack(first.id, first.token, None).await.unwrap();
+        let second = group.claim().await;
+        group.nack(second.id, second.token, None).await.unwrap();
+        assert_eq!(group.dead_letters().await.len(), 1);
+
+        assert!(group.reprocess_dead_letter(first.id).await.unwrap());
+        assert!(group.dead_letters().await.is_empty());
+        assert_eq!(group.len().await, 1);
+
+        let reclaimed = group.claim().await;
+        assert_eq!(reclaimed.id, first.id, "reprocessing keeps the original message id");
+        assert_eq!(reclaimed.item, 7);
+        assert_eq!(
+            reclaimed.delivery_count, 1,
+            "reprocessing is a fresh delivery cycle, not a continuation of the exhausted one"
+        );
+    }
+
+    #[tokio::test]
+    async fn purging_a_dead_letter_discards_it_instead_of_returning_it() {
+        let dir = tempdir().unwrap();
+        let group =
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap();
+        group.enqueue(1).await.unwrap();
+        let first = group.claim().await;
+        group.nack(first.id, first.token, None).await.unwrap();
+        let second = group.claim().await;
+        group.nack(second.id, second.token, None).await.unwrap();
+
+        assert!(group.purge_dead_letter(first.id).await.unwrap());
+        assert!(group.dead_letters().await.is_empty());
+        assert!(group.is_empty().await, "a purged message must not come back anywhere");
+        assert!(!group.reprocess_dead_letter(first.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reprocessing_or_purging_an_unknown_id_returns_false() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        let bogus_id = qaas_types::MessageId::new();
+
+        assert!(!group.reprocess_dead_letter(bogus_id).await.unwrap());
+        assert!(!group.purge_dead_letter(bogus_id).await.unwrap());
     }
 }

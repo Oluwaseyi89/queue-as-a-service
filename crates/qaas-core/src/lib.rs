@@ -24,24 +24,31 @@
 //! (`feature/retry-and-backoff-policies`) governs how long a nacked or
 //! expired message waits before it's claimable again — exponential
 //! backoff with jitter, so a struggling downstream dependency doesn't
-//! get hammered by every consumer retrying in lockstep. Still missing,
-//! deliberately: a dead-letter destination for messages that keep
-//! failing no matter how long they wait (`feature/dead-letter-queue`) —
-//! `RetryPolicy` backs off forever; it never decides a message has
-//! failed too many times to keep trying.
+//! get hammered by every consumer retrying in lockstep — and, via
+//! `max_attempts`, how many times it gets to fail before giving up.
+//! [`dead_letter::DeadLetterQueue`] (`feature/dead-letter-queue`) is
+//! where a message that's given up on lands: a durable, inspectable
+//! destination instead of being silently dropped. `ConsumerGroup` owns
+//! one alongside its live queue and routes exhausted messages there
+//! automatically — see [`ConsumerGroup::dead_letters`],
+//! [`ConsumerGroup::reprocess_dead_letter`], and
+//! [`ConsumerGroup::purge_dead_letter`].
 //!
 //! This is also the first thing in this crate to depend on
 //! [`qaas_types`]: `ConsumerGroup` reuses `qaas_types::MessageId` for
 //! message identity rather than inventing a second ID type, since the
 //! whole reason `MessageId` was built as `UUIDv7` (time-ordered) applies
-//! just as much here as in [`Envelope`](qaas_types::Envelope).
+//! just as much here as in [`Envelope`](qaas_types::Envelope). Dead
+//! letters similarly reuse `qaas_types::Timestamp`.
 
 pub mod consumer_group;
+pub mod dead_letter;
 pub mod queue;
 pub mod retry;
 pub mod wal;
 
 pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
+pub use dead_letter::{DeadLetter, DeadLetterQueue};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
 pub use retry::RetryPolicy;
 pub use wal::Wal;
