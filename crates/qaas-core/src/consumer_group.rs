@@ -14,13 +14,23 @@
 //! it grants a time-boxed, exclusive **lease**: while the lease is
 //! active, no other consumer can claim that message. The consumer that
 //! holds the lease must [`ack`](ConsumerGroup::ack) it (permanent,
-//! durable removal) or [`nack`](ConsumerGroup::nack) it (immediate
-//! redelivery) before the lease's visibility timeout elapses; if neither
-//! happens — the consumer crashed, hung, or was simply too slow — the
-//! lease expires on its own and the message becomes claimable again.
-//! That's what makes this at-least-once rather than at-most-once: a
-//! message is never dropped just because whoever had it stopped
-//! responding.
+//! durable removal) or [`nack`](ConsumerGroup::nack) it (early release,
+//! skipping the rest of the visibility timeout) before the lease's
+//! visibility timeout elapses; if neither happens — the consumer
+//! crashed, hung, or was simply too slow — the lease expires on its own
+//! and the message eventually becomes claimable again. That's what makes
+//! this at-least-once rather than at-most-once: a message is never
+//! dropped just because whoever had it stopped responding.
+//!
+//! Neither path makes the message claimable *again immediately*,
+//! though — both go through [`RetryPolicy`]'s exponential backoff first.
+//! nack deliberately isn't a bypass around that: if it were, a consumer
+//! that fails because a downstream dependency (an LLM provider, a
+//! rate-limited API) is struggling and dutifully nacks would cause every
+//! consumer in the group to immediately re-claim and re-fail in a tight
+//! loop — exactly the thundering-herd behavior this module exists to
+//! prevent, just triggered by explicit failure signaling instead of
+//! silent timeouts.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -33,6 +43,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
+use crate::retry::RetryPolicy;
 use crate::wal::Wal;
 
 /// One entry in a [`ConsumerGroup`]'s WAL. Only enqueue and permanent
@@ -70,9 +81,20 @@ struct Leased<T> {
     delivery_count: u32,
 }
 
+/// A message that failed a delivery attempt (nack or lease expiry) and
+/// is waiting out its [`RetryPolicy`] backoff before becoming claimable
+/// again.
+struct Delayed<T> {
+    id: MessageId,
+    item: T,
+    delivery_count: u32,
+    available_at: Instant,
+}
+
 struct State<T> {
     pending: VecDeque<Pending<T>>,
     leased: HashMap<MessageId, Leased<T>>,
+    delayed: Vec<Delayed<T>>,
 }
 
 /// Proof that a caller holds the lease it's trying to resolve.
@@ -118,13 +140,15 @@ pub struct Claim<T> {
 /// consumer delivery. See the module docs for the delivery model.
 pub struct ConsumerGroup<T> {
     state: Mutex<State<T>>,
-    /// Signaled whenever a message becomes claimable — a fresh enqueue,
-    /// an explicit nack, or a lease expiring — so a consumer blocked in
-    /// `claim` wakes up instead of waiting out a timer it no longer
-    /// needs to.
+    /// Signaled whenever a message becomes claimable, or whenever the
+    /// earliest time a message *could* become claimable changes — a
+    /// fresh enqueue, an explicit nack, a lease expiring, or a new lease
+    /// being granted — so a consumer blocked in `claim` wakes up instead
+    /// of waiting out a timer it no longer needs to.
     changed: Notify,
     wal: Wal<WalRecord<T>>,
     visibility_timeout: Duration,
+    retry_policy: RetryPolicy,
     next_lease_token: AtomicU64,
 }
 
@@ -135,14 +159,19 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// run comes back as pending, per this type's documented at-least-
     /// once, restart-resets-delivery-count behavior.
     ///
-    /// `visibility_timeout` applies to every lease this group grants;
-    /// there's no per-claim override in this branch.
+    /// `visibility_timeout` applies to every lease this group grants,
+    /// and `retry_policy` to every nack or lease expiry; neither has a
+    /// per-claim or per-message override in this branch.
     ///
     /// # Errors
     ///
     /// Returns an error under the same conditions as
     /// [`Wal::open`](crate::wal::Wal::open).
-    pub async fn open(path: impl AsRef<Path>, visibility_timeout: Duration) -> io::Result<Self> {
+    pub async fn open(
+        path: impl AsRef<Path>,
+        visibility_timeout: Duration,
+        retry_policy: RetryPolicy,
+    ) -> io::Result<Self> {
         let (wal, records) = Wal::open(path).await?;
         let mut pending: VecDeque<Pending<T>> = VecDeque::new();
         for record in records {
@@ -159,10 +188,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         }
 
         Ok(Self {
-            state: Mutex::new(State { pending, leased: HashMap::new() }),
+            state: Mutex::new(State { pending, leased: HashMap::new(), delayed: Vec::new() }),
             changed: Notify::new(),
             wal,
             visibility_timeout,
+            retry_policy,
             next_lease_token: AtomicU64::new(0),
         })
     }
@@ -189,11 +219,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         Ok(id)
     }
 
-    /// The total number of messages not yet acknowledged — claimable
-    /// plus currently leased.
+    /// The total number of messages not yet acknowledged — claimable,
+    /// currently leased, or waiting out a retry backoff delay.
     pub async fn len(&self) -> usize {
         let state = self.state.lock().await;
-        state.pending.len() + state.leased.len()
+        state.pending.len() + state.leased.len() + state.delayed.len()
     }
 
     /// Whether there are no unacknowledged messages at all.
@@ -219,6 +249,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         loop {
             let mut state = self.state.lock().await;
             self.reclaim_expired_leases(&mut state);
+            Self::promote_ready_delayed(&mut state);
 
             if let Some(Pending { id, item, delivery_count }) = state.pending.pop_front() {
                 let delivery_count = delivery_count + 1;
@@ -242,7 +273,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 return Claim { id, token, item, delivery_count };
             }
 
-            let wake_at = Self::earliest_expiry(&state);
+            let wake_at = Self::earliest_wake(&state);
             drop(state);
 
             match wake_at {
@@ -285,24 +316,21 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         Ok(true)
     }
 
-    /// Immediately releases a claimed message back to the pending pool,
-    /// instead of waiting for its lease to expire on its own.
+    /// Releases a claimed message back to the retry pool immediately —
+    /// as opposed to waiting for its lease to expire on its own — where
+    /// it waits out this group's [`RetryPolicy`] backoff before becoming
+    /// claimable again, exactly as an expired lease would.
     ///
     /// Same stale-lease handling as [`ack`](Self::ack): returns `false`
     /// without effect if `id`/`token` don't match a currently-active
     /// lease. No WAL write here — nack doesn't durably commit anything,
-    /// it only changes which in-memory pool the message sits in, which
-    /// is exactly the same state a plain lease expiry would produce.
+    /// it only changes which in-memory pool the message sits in.
     pub async fn nack(&self, id: MessageId, token: LeaseToken) -> bool {
         let requeued = {
             let mut state = self.state.lock().await;
             match state.leased.remove(&id) {
                 Some(lease) if lease.token == token => {
-                    state.pending.push_back(Pending {
-                        id,
-                        item: lease.item,
-                        delivery_count: lease.delivery_count,
-                    });
+                    self.schedule_retry(&mut state, id, lease.item, lease.delivery_count);
                     true
                 }
                 // Wrong token (a stale nack for an already-redelivered
@@ -321,10 +349,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         requeued
     }
 
-    /// Moves every lease whose visibility timeout has passed back into
-    /// `pending`. Called at the start of every [`claim`](Self::claim), so
-    /// a consumer can never observe a message as unclaimable purely
-    /// because its previous lease-holder crashed.
+    /// Moves every lease whose visibility timeout has passed into the
+    /// retry backoff pool (see [`schedule_retry`](Self::schedule_retry)).
+    /// Called at the start of every [`claim`](Self::claim), so a
+    /// consumer can never observe a message as permanently unclaimable
+    /// purely because its previous lease-holder crashed.
     fn reclaim_expired_leases(&self, state: &mut State<T>) {
         let now = Instant::now();
         let expired: Vec<MessageId> = state
@@ -339,19 +368,63 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         }
         for id in expired {
             let lease = state.leased.remove(&id).expect("id came from iterating this same map");
-            state.pending.push_back(Pending {
-                id,
-                item: lease.item,
-                delivery_count: lease.delivery_count,
-            });
+            self.schedule_retry(state, id, lease.item, lease.delivery_count);
         }
-        // Multiple messages may have just become claimable at once —
-        // wake every blocked claimer to recheck, not just one.
+        // Multiple messages may have just become claimable (or had their
+        // next-wake time change) at once — wake every blocked claimer to
+        // recheck, not just one.
         self.changed.notify_waiters();
     }
 
-    fn earliest_expiry(state: &State<T>) -> Option<Instant> {
-        state.leased.values().map(|lease| lease.expires_at).min()
+    /// Puts a failed delivery into the backoff pool rather than directly
+    /// back into `pending`, per this group's [`RetryPolicy`]. Shared by
+    /// [`nack`](Self::nack) and [`reclaim_expired_leases`](Self::reclaim_expired_leases) —
+    /// a lease expiry and an explicit nack both mean "this delivery
+    /// attempt failed," and both need the same backoff treatment to
+    /// avoid the thundering-herd behavior this module exists to prevent.
+    fn schedule_retry(&self, state: &mut State<T>, id: MessageId, item: T, delivery_count: u32) {
+        let delay = self.retry_policy.delay_for(delivery_count);
+        state.delayed.push(Delayed {
+            id,
+            item,
+            delivery_count,
+            available_at: Instant::now() + delay,
+        });
+    }
+
+    /// Moves every delayed message whose backoff has elapsed into
+    /// `pending`. Called at the start of every [`claim`](Self::claim),
+    /// after [`reclaim_expired_leases`](Self::reclaim_expired_leases) so
+    /// a lease that just expired with a very short (or zero) computed
+    /// backoff can become claimable again within the same call.
+    fn promote_ready_delayed(state: &mut State<T>) {
+        if state.delayed.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut still_delayed = Vec::with_capacity(state.delayed.len());
+        for entry in state.delayed.drain(..) {
+            if entry.available_at <= now {
+                state.pending.push_back(Pending {
+                    id: entry.id,
+                    item: entry.item,
+                    delivery_count: entry.delivery_count,
+                });
+            } else {
+                still_delayed.push(entry);
+            }
+        }
+        state.delayed = still_delayed;
+    }
+
+    /// The earliest instant anything currently leased or delayed could
+    /// become claimable — a blocked [`claim`](Self::claim) sleeps until
+    /// this, recomputed fresh every time it loops, rather than on any
+    /// fixed polling interval.
+    fn earliest_wake(state: &State<T>) -> Option<Instant> {
+        let earliest_lease_expiry = state.leased.values().map(|lease| lease.expires_at).min();
+        let earliest_retry = state.delayed.iter().map(|entry| entry.available_at).min();
+        [earliest_lease_expiry, earliest_retry].into_iter().flatten().min()
     }
 }
 
@@ -363,6 +436,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::ConsumerGroup;
+    use crate::retry::RetryPolicy;
 
     /// Generous enough that a test asserting "this should NOT have
     /// expired yet" isn't flaky under CI scheduling jitter, short enough
@@ -371,8 +445,22 @@ mod tests {
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
     const SHORT_TIMEOUT: Duration = Duration::from_millis(30);
 
+    /// For tests that aren't specifically about retry/backoff timing —
+    /// makes a nack or a lease expiry behave like it did before this
+    /// branch, so tests written for `claim`/`ack`/lease-expiry mechanics
+    /// don't also have to account for a backoff delay they're not
+    /// testing.
+    const NO_RETRY_DELAY: RetryPolicy = RetryPolicy {
+        base_delay: Duration::ZERO,
+        max_delay: Duration::ZERO,
+        multiplier: 1.0,
+        jitter: 0.0,
+    };
+
     async fn open(dir: &tempfile::TempDir, visibility_timeout: Duration) -> ConsumerGroup<i32> {
-        ConsumerGroup::open(dir.path().join("wal.log"), visibility_timeout).await.unwrap()
+        ConsumerGroup::open(dir.path().join("wal.log"), visibility_timeout, NO_RETRY_DELAY)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -426,20 +514,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nack_redelivers_immediately_without_waiting_for_the_timeout() {
+    async fn an_expired_lease_also_waits_out_the_retry_backoff_not_just_the_visibility_timeout() {
+        let policy = RetryPolicy {
+            base_delay: Duration::from_millis(60),
+            max_delay: Duration::from_millis(60),
+            multiplier: 1.0,
+            jitter: 0.0,
+        };
         let dir = tempdir().unwrap();
-        // Deliberately long — if nack didn't work and the test fell back
-        // to waiting out the real timeout, this bounds how long that
-        // would take, and the explicit timeout below fails fast instead.
-        let group = open(&dir, LONG_TIMEOUT).await;
+        let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), SHORT_TIMEOUT, policy)
+            .await
+            .unwrap();
+        group.enqueue(1).await.unwrap();
+
+        let first = group.claim().await;
+
+        // Give the lease time to expire (SHORT_TIMEOUT = 30ms) but not
+        // enough for the 60ms retry backoff after that to have elapsed
+        // too — proving the message doesn't become claimable the instant
+        // the lease expires.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), group.claim()).await.is_err(),
+            "an expired lease must still go through the retry backoff, not skip it"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(2), group.claim())
+            .await
+            .expect("message should become claimable once both timeouts have elapsed");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.delivery_count, 2);
+    }
+
+    #[tokio::test]
+    async fn len_counts_delayed_messages_waiting_out_their_retry_backoff() {
+        let policy = RetryPolicy {
+            base_delay: Duration::from_secs(60),
+            max_delay: Duration::from_secs(60),
+            multiplier: 1.0,
+            jitter: 0.0,
+        };
+        let dir = tempdir().unwrap();
+        let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, policy)
+            .await
+            .unwrap();
+        group.enqueue(1).await.unwrap();
+
+        let claim = group.claim().await;
+        assert!(group.nack(claim.id, claim.token).await);
+
+        // The message is now sitting in the delayed pool (a 60s backoff,
+        // far longer than this test runs) rather than pending or leased
+        // — `len` must still count it as an outstanding message.
+        assert_eq!(group.len().await, 1);
+        assert!(!group.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn nack_schedules_a_retry_instead_of_waiting_out_the_visibility_timeout() {
+        // Short, but non-zero — non-zero so this test can actually prove
+        // nack goes through backoff at all (with NO_RETRY_DELAY, this
+        // test couldn't distinguish "nack respects the policy" from
+        // "nack ignores the policy entirely"); short so the suite stays
+        // fast and so it stays far below `LONG_TIMEOUT`, proving nack is
+        // nowhere near waiting out the full visibility timeout either.
+        let policy = RetryPolicy {
+            base_delay: Duration::from_millis(60),
+            max_delay: Duration::from_millis(60),
+            multiplier: 1.0,
+            jitter: 0.0,
+        };
+        let dir = tempdir().unwrap();
+        let group = ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, policy)
+            .await
+            .unwrap();
         group.enqueue(1).await.unwrap();
 
         let first = group.claim().await;
         assert!(group.nack(first.id, first.token).await);
 
-        let second = tokio::time::timeout(Duration::from_millis(200), group.claim())
+        // Not instant: still within the retry delay, so nothing should
+        // be claimable yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(15), group.claim()).await.is_err(),
+            "nack must not bypass the retry backoff entirely"
+        );
+
+        // But long before `LONG_TIMEOUT` would have elapsed via lease
+        // expiry alone.
+        let second = tokio::time::timeout(Duration::from_secs(2), group.claim())
             .await
-            .expect("nack should make the message claimable again immediately");
+            .expect("message should become claimable again once its retry delay elapses");
         assert_eq!(second.id, first.id);
         assert_eq!(second.delivery_count, 2);
     }
@@ -516,7 +680,8 @@ mod tests {
         let path = dir.path().join("wal.log");
 
         {
-            let group = ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT).await.unwrap();
+            let group =
+                ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
             group.enqueue(1).await.unwrap();
             group.enqueue(2).await.unwrap();
             group.enqueue(3).await.unwrap();
@@ -525,7 +690,8 @@ mod tests {
             assert_eq!(claim.item, 1);
         }
 
-        let recovered = ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT).await.unwrap();
+        let recovered =
+            ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
         assert_eq!(recovered.len().await, 3);
 
         // The previously-claimed-but-unacked message comes back as a
@@ -546,7 +712,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let group = Arc::new(
-            ConsumerGroup::<usize>::open(dir.path().join("wal.log"), LONG_TIMEOUT).await.unwrap(),
+            ConsumerGroup::<usize>::open(dir.path().join("wal.log"), LONG_TIMEOUT, NO_RETRY_DELAY)
+                .await
+                .unwrap(),
         );
         for i in 0..TOTAL {
             group.enqueue(i).await.unwrap();
