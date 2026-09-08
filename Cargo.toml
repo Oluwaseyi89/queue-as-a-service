@@ -19,13 +19,15 @@ qaas-types = { path = "crates/qaas-types" }
 qaas-core = { path = "crates/qaas-core" }
 qaas-client = { path = "crates/qaas-client" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+crc32fast = "1"
+tempfile = "3"
 
 # Workspace-wide lint policy. Every member crate opts in with
 # `[lints] workspace = true` so we don't have to repeat this four times.
