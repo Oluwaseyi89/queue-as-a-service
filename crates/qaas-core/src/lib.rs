@@ -40,10 +40,20 @@
 //! whole reason `MessageId` was built as `UUIDv7` (time-ordered) applies
 //! just as much here as in [`Envelope`](qaas_types::Envelope). Dead
 //! letters similarly reuse `qaas_types::Timestamp`.
+//!
+//! [`raft`] (`feature/raft-replication`) is a separate concern from
+//! everything above: leader election and log replication *across
+//! nodes*, using [`openraft`], the backbone Phase 3 builds a
+//! self-healing HA cluster on instead of a single point of failure. It
+//! is not yet wired to `ConsumerGroup` — see the module's own docs for
+//! why that's a deliberate scope cut, and for two placeholders
+//! (an in-memory log store, an in-process network transport) it's
+//! honest about not being production-ready yet.
 
 pub mod consumer_group;
 pub mod dead_letter;
 pub mod queue;
+pub mod raft;
 pub mod retry;
 pub mod wal;
 
