@@ -8,7 +8,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Isenewo Oluwaseyi Ephraim <isenewoephr2012@gmail.com>"]
 repository = "https://github.com/Oluwaseyi89/queue-as-a-service"
 
@@ -30,6 +30,8 @@ crc32fast = "1"
 tempfile = "3"
 fastrand = "2"
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+rmcp = { version = "3", features = ["server", "transport-io"] }
+schemars = "1"
 
 # Workspace-wide lint policy. Every member crate opts in with
 # `[lints] workspace = true` so we don't have to repeat this four times.

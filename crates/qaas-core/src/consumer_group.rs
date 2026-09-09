@@ -159,6 +159,39 @@ struct State<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseToken(u64);
 
+impl LeaseToken {
+    /// The token's underlying value, for a caller that needs to carry it
+    /// across a boundary this type itself doesn't understand — a network
+    /// wire format, a database column — and hand back an equivalent
+    /// [`LeaseToken`] later via [`from_u64`](Self::from_u64).
+    ///
+    /// Deliberately not `Serialize`/`Deserialize`: those traits would
+    /// make "a bare integer" part of this type's API contract implicitly,
+    /// forever, the moment any crate outside `qaas-core` derives through
+    /// it. An explicit method pair keeps that choice visible at the one
+    /// call site (`qaas-server`'s MCP tool layer, as of
+    /// `feature/mcp-server-interface`) that actually needs it, rather
+    /// than baking it into the type for every future caller whether they
+    /// need it or not.
+    #[must_use]
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstructs a token from a value previously obtained from
+    /// [`as_u64`](Self::as_u64). Does not — cannot — verify the value
+    /// actually corresponds to a lease this group ever granted; that
+    /// check happens the same place it always has, inside
+    /// [`ConsumerGroup::ack`]/[`nack`](ConsumerGroup::nack) comparing
+    /// against the currently-active lease. A forged or stale value simply
+    /// fails to match there, exactly as a token from an expired lease
+    /// already does.
+    #[must_use]
+    pub fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// A successfully claimed message, returned by [`ConsumerGroup::claim`].
 ///
 /// Hand `id` and `token` back to [`ConsumerGroup::ack`] or
@@ -246,12 +279,11 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                     pending.push_back(Pending { id, item, delivery_count: 0, idempotency_key });
                 }
                 WalRecord::Ack(id) => {
-                    if let Some(index) = pending.iter().position(|entry| entry.id == id) {
-                        if let Some(acked) = pending.remove(index) {
-                            if let Some(key) = &acked.idempotency_key {
-                                dedup.remove(key);
-                            }
-                        }
+                    if let Some(index) = pending.iter().position(|entry| entry.id == id)
+                        && let Some(acked) = pending.remove(index)
+                        && let Some(key) = &acked.idempotency_key
+                    {
+                        dedup.remove(key);
                     }
                 }
             }
@@ -851,6 +883,23 @@ mod tests {
 
         assert!(group.ack(claim.id, claim.token).await.unwrap());
         assert_eq!(group.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn lease_token_round_trips_through_as_u64_and_from_u64() {
+        // Proves the escape hatch `feature/mcp-server-interface` needs —
+        // a token handed to an out-of-process caller as a plain integer,
+        // then handed back — actually resolves the same lease it came
+        // from, not just that the two integers happen to be equal.
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let claim = group.claim().await;
+        let carried = claim.token.as_u64();
+        let reconstructed = super::LeaseToken::from_u64(carried);
+
+        assert!(group.ack(claim.id, reconstructed).await.unwrap());
     }
 
     #[tokio::test]
