@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+# Not ready for crates.io yet — see qaas-types's Cargo.toml for the same
+# note.
+publish = false
 
 [lints]
 workspace = true
@@ -19,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 crc32fast.workspace = true
 fastrand.workspace = true
+openraft.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

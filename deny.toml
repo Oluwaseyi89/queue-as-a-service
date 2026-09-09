@@ -23,9 +23,25 @@ allow = [
     "Zlib",
 ]
 
+# Our own crates are deliberately unlicensed (see CLAUDE.md) and are
+# workspace-local path dependencies, never published to crates.io — cargo-deny
+# otherwise flags them as "unlicensed" the same way it would an external
+# crate genuinely missing a license, which is a false positive here, not a
+# real gap.
+[licenses.private]
+ignore = true
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace members reference each other via path dependencies with no
+# semver requirement (`qaas-core.workspace = true`, resolving to a
+# `{ path = "crates/qaas-core" }` entry) — cargo-deny's wildcard check
+# otherwise treats that the same as an external `dep = "*"` version
+# requirement, which is what `wildcards = "deny"` above is actually meant
+# to catch. This exempts path dependencies specifically, not version
+# wildcards in general.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
