@@ -140,10 +140,10 @@ async fn losing_the_leader_triggers_reelection_among_the_survivors() {
     let new_leader = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for raft in [&raft2, &raft3] {
-                if let Some(leader) = raft.current_leader().await {
-                    if leader != 1 {
-                        return leader;
-                    }
+                if let Some(leader) = raft.current_leader().await
+                    && leader != 1
+                {
+                    return leader;
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
