@@ -51,6 +51,14 @@
 //! "who should be a member right now") plus a
 //! [`membership::MembershipWatcher`] that polls it and reconciles actual
 //! membership to match.
+//!
+//! `circuit_breaker_tests` (`feature/circuit-breaker-fallback`) isn't a
+//! module this crate exposes — it's a `#[cfg(test)]`-only proof that
+//! [`crate::circuit_breaker`]'s generic breaker-and-fallback pattern
+//! actually degrades gracefully against a real "replica or downstream
+//! dependency" (this branch's own words, from `Plan.md`), using this
+//! module's own multi-node clusters as that dependency rather than a
+//! synthetic stand-in.
 
 use std::io::Cursor;
 
@@ -61,6 +69,8 @@ pub mod membership;
 pub mod network;
 pub mod state_machine;
 
+#[cfg(test)]
+mod circuit_breaker_tests;
 #[cfg(test)]
 mod membership_tests;
 #[cfg(test)]

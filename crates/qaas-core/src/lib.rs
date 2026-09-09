@@ -55,7 +55,18 @@
 //! [`MembershipSource`](raft::MembershipSource) reports, with no
 //! process restart and no operator hand-driving `openraft`'s membership
 //! API directly.
+//!
+//! [`circuit_breaker`] (`feature/circuit-breaker-fallback`) is a
+//! different kind of resilience than any of the above: not "how does a
+//! message survive a crash" but "how does a caller stay available when
+//! whatever it depends on doesn't." [`circuit_breaker::CircuitBreaker`]
+//! and [`circuit_breaker::HybridGuard`] port global-rate-limiter's 3-state
+//! breaker and local-cache fallback pattern (see `CLAUDE.md`'s reference
+//! architecture section) as a generic primitive, proven against a real
+//! dependency this crate already has — a [`raft`] cluster's leader — in
+//! `raft`'s own `circuit_breaker_tests`.
 
+pub mod circuit_breaker;
 pub mod consumer_group;
 pub mod dead_letter;
 pub mod queue;
@@ -63,6 +74,10 @@ pub mod raft;
 pub mod retry;
 pub mod wal;
 
+pub use circuit_breaker::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitState, FallbackCache,
+    HybridGuard, HybridOutcome,
+};
 pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
 pub use dead_letter::{DeadLetter, DeadLetterQueue};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
