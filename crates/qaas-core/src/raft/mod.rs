@@ -43,19 +43,34 @@
 //! same reason the log store and network are placeholders: proving the
 //! consensus plumbing works with a simple, obviously-correct state
 //! machine first, before mapping this crate's real domain onto it.
+//!
+//! [`membership`] (`feature/cluster-membership-discovery`) is how nodes
+//! get added to or removed from a running cluster without a human
+//! driving `openraft`'s add-learner-then-promote protocol by hand —
+//! config-based discovery (a [`membership::MembershipSource`] answering
+//! "who should be a member right now") plus a
+//! [`membership::MembershipWatcher`] that polls it and reconciles actual
+//! membership to match.
 
 use std::io::Cursor;
 
 use openraft::declare_raft_types;
 
 pub mod log_store;
+pub mod membership;
 pub mod network;
 pub mod state_machine;
 
 #[cfg(test)]
+mod membership_tests;
+#[cfg(test)]
 mod tests;
 
 pub use log_store::LogStore;
+pub use membership::{
+    ClusterMembers, FileMembershipSource, MembershipDiff, MembershipSource, MembershipWatcher,
+    ReconcileError, StaticMembershipSource,
+};
 pub use network::{InProcessNetwork, InProcessNetworkHub};
 pub use state_machine::{Request, Response, StateMachineStore};
 
