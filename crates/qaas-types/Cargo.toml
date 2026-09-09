@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+# Not ready for crates.io yet — a workspace-internal path dependency of
+# qaas-core/qaas-server/qaas-client for now. Revisit once there's an
+# actual reason to publish it standalone.
+publish = false
 
 [lints]
 workspace = true
