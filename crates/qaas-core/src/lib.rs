@@ -49,6 +49,12 @@
 //! why that's a deliberate scope cut, and for two placeholders
 //! (an in-memory log store, an in-process network transport) it's
 //! honest about not being production-ready yet.
+//! [`raft::membership`] (`feature/cluster-membership-discovery`) adds
+//! config-based discovery on top: a running cluster's node set can grow
+//! or shrink by editing what a
+//! [`MembershipSource`](raft::MembershipSource) reports, with no
+//! process restart and no operator hand-driving `openraft`'s membership
+//! API directly.
 
 pub mod consumer_group;
 pub mod dead_letter;
