@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+# Not ready for crates.io yet — see qaas-types's Cargo.toml for the same
+# note.
+publish = false
 
 [lints]
 workspace = true
