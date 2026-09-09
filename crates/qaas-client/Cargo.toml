@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+# Not ready for crates.io yet — see qaas-types's Cargo.toml for the same
+# note. This one especially: `feature/client-sdks` (Phase 9) is where
+# this crate is meant to become a real, publishable SDK, not now.
+publish = false
 
 [lints]
 workspace = true
