@@ -65,6 +65,19 @@
 //! architecture section) as a generic primitive, proven against a real
 //! dependency this crate already has — a [`raft`] cluster's leader — in
 //! `raft`'s own `circuit_breaker_tests`.
+//!
+//! `feature/durable-agent-workflows` opens Phase 4 in this crate with
+//! [`ConsumerGroup::checkpoint`]: a multi-step agent task (chained LLM
+//! calls, a human-in-the-loop pause) can durably save its progress
+//! against the message it's currently working on, and see that progress
+//! again on a later [`Claim`] — whether that claim follows a crash, an
+//! expired lease, or a deliberate `nack` used to release the message for
+//! a pause — instead of restarting the whole task from nothing. This
+//! branch also fixed a real, pre-existing durability bug it found while
+//! implementing checkpoint replay: a dead-lettered message used to
+//! resurrect as pending after a restart, because dead-lettering never
+//! recorded anything in `ConsumerGroup`'s own WAL — see
+//! `consumer_group::WalRecord::DeadLettered`'s docs.
 
 pub mod circuit_breaker;
 pub mod consumer_group;
