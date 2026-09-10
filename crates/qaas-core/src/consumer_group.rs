@@ -56,6 +56,27 @@
 //! redelivered message that's reprocessed doesn't get executed — or
 //! billed — twice, even though this queue's own delivery guarantee is
 //! only ever at-least-once.
+//!
+//! Checkpointing (`feature/durable-agent-workflows`) is a different
+//! problem from any of the above: not "does the message survive a
+//! crash" (it always has, since `feature/wal-persistence`) but "does a
+//! multi-step *task* survive one without redoing steps it already
+//! finished." [`checkpoint`](ConsumerGroup::checkpoint) durably saves a
+//! caller-shaped progress snapshot against the currently-leased message,
+//! without touching the lease itself; the next
+//! [`claim`](ConsumerGroup::claim) of that message — after a crash, an
+//! expired lease, or an explicit `nack` used deliberately to release the
+//! message for a human-in-the-loop pause that might last hours — surfaces
+//! it as [`Claim::checkpoint`]. Reusing `nack` for pausing rather than
+//! adding a dedicated "pause" primitive is deliberate, not an oversight:
+//! it means a long-running workflow's pauses count toward
+//! `retry_policy`'s `max_attempts` the same way failures do, which is a
+//! real, accepted tradeoff (an operator running workflows with many
+//! human-in-the-loop steps should configure a generous or unlimited
+//! `max_attempts` for that queue) in exchange for not bolting on a
+//! second delivery-lifecycle verb next to `ack`/`nack` — exactly the
+//! "without a separate workflow engine" framing this branch's own
+//! `Plan.md` entry asks for.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -66,22 +87,35 @@ use std::time::{Duration, Instant};
 use qaas_types::{IdempotencyKey, MessageId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
 use crate::dead_letter::{DeadLetter, DeadLetterQueue};
 use crate::retry::RetryPolicy;
 use crate::wal::Wal;
 
-/// One entry in a [`ConsumerGroup`]'s WAL. Only enqueue and permanent
-/// removal (ack) are durable — a claim is a lease, not a commitment, so
-/// there is deliberately no "Claim" record: persisting it would imply a
-/// crash should remember who had a message leased, but a lease's whole
-/// point is that it doesn't outlive anything, not even gracefully. On
-/// restart, every unacked message — whether it was sitting untouched or
-/// actively (but unacknowledged) leased when the process died — replays
-/// back as available to claim. That's a real, documented limitation:
+/// One entry in a [`ConsumerGroup`]'s WAL. A claim is a lease, not a
+/// commitment, so there is deliberately no "Claim" record: persisting it
+/// would imply a crash should remember who had a message leased, but a
+/// lease's whole point is that it doesn't outlive anything, not even
+/// gracefully. On restart, every message that's still *live* — whether
+/// it was sitting untouched, actively (but unacknowledged) leased, or
+/// waiting out a retry backoff when the process died — replays back as
+/// available to claim. That's a real, documented limitation:
 /// `delivery_count` (see [`Claim`]) resets to zero across a restart,
 /// because delivery attempts aren't durable, only messages are.
+///
+/// "Live" is the operative word: [`Ack`](Self::Ack) and
+/// [`DeadLettered`](Self::DeadLettered) both durably end a message's
+/// life in *this* WAL (permanently, or by handing it off to the DLQ's
+/// own WAL respectively) — without one of those, the message's original
+/// [`Enqueue`](Self::Enqueue) record would still be sitting un-acked
+/// here forever, which is exactly what used to make a dead-lettered
+/// message resurrect as pending after a restart despite also sitting in
+/// the DLQ, before `DeadLettered` existed. See
+/// [`resolve_failed_delivery`](ConsumerGroup::resolve_failed_delivery)
+/// for why a `DeadLettered` record — unlike `Ack` — must never cause a
+/// replaying restart to release the message's idempotency key.
 #[derive(Serialize, Deserialize)]
 enum WalRecord<T> {
     /// The `Option<IdempotencyKey>` is exactly what the caller passed to
@@ -92,6 +126,21 @@ enum WalRecord<T> {
     /// identically from the id would just be redundant.
     Enqueue(MessageId, Option<IdempotencyKey>, T),
     Ack(MessageId),
+    /// Recorded when a failed delivery exhausts its
+    /// [`RetryPolicy`](crate::RetryPolicy) and the message moves to the
+    /// DLQ instead of being scheduled for another attempt — see this
+    /// enum's own docs for why this needs to be its own variant rather
+    /// than reusing `Ack`.
+    DeadLettered(MessageId),
+    /// Durably records `feature/durable-agent-workflows`' checkpoint
+    /// state for a message that's still live (pending, leased, or
+    /// delayed) — the resumable progress a multi-step agent workflow
+    /// saves via [`checkpoint`](ConsumerGroup::checkpoint) so a later
+    /// claim, whether after a crash or a deliberate pause, can pick up
+    /// where the last one left off instead of starting the whole task
+    /// over. Only the latest checkpoint per message matters; an older
+    /// one is simply superseded, never merged with the new one.
+    Checkpoint(MessageId, Value),
 }
 
 /// A message waiting to be claimed.
@@ -102,6 +151,10 @@ struct Pending<T> {
     /// it's never been claimed).
     delivery_count: u32,
     idempotency_key: Option<IdempotencyKey>,
+    /// The latest state saved via [`ConsumerGroup::checkpoint`] for this
+    /// message, if any — carried forward from wherever it was last set
+    /// (a prior lease, a prior delayed retry) so a claim sees it.
+    checkpoint: Option<Value>,
 }
 
 /// A message currently out on lease to some consumer.
@@ -113,6 +166,10 @@ struct Leased<T> {
     expires_at: Instant,
     delivery_count: u32,
     idempotency_key: Option<IdempotencyKey>,
+    /// See [`Pending::checkpoint`]. Updatable in place, mid-lease, via
+    /// [`ConsumerGroup::checkpoint`] — unlike every other field here,
+    /// this one can change without the lease itself changing.
+    checkpoint: Option<Value>,
 }
 
 /// A message that failed a delivery attempt (nack or lease expiry) and
@@ -124,6 +181,8 @@ struct Delayed<T> {
     delivery_count: u32,
     available_at: Instant,
     idempotency_key: Option<IdempotencyKey>,
+    /// See [`Pending::checkpoint`].
+    checkpoint: Option<Value>,
 }
 
 struct State<T> {
@@ -219,6 +278,15 @@ pub struct Claim<T> {
     /// [`ConsumerGroup::open`]), so a crash genuinely loses that count
     /// rather than this being an oversight.
     pub delivery_count: u32,
+    /// The latest state a previous holder of this message saved via
+    /// [`ConsumerGroup::checkpoint`], if any — `None` for a message's
+    /// first-ever claim, or one that was never checkpointed. Unlike
+    /// `delivery_count`, this *does* survive a restart (it's recorded in
+    /// the WAL) and *does* survive an explicit [`nack`](ConsumerGroup::nack)
+    /// — it's how a multi-step agent workflow resumes a task instead of
+    /// starting over, whether the previous attempt ended in a crash or a
+    /// deliberate pause. See the module docs for the worked scenario.
+    pub checkpoint: Option<Value>,
 }
 
 /// A shared work queue with lease-based, at-least-once, competing-
@@ -270,13 +338,26 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let (wal, records) = Wal::open(path).await?;
         let mut pending: VecDeque<Pending<T>> = VecDeque::new();
         let mut dedup: HashMap<IdempotencyKey, MessageId> = HashMap::new();
+        // Accumulated separately from `pending` rather than looked up and
+        // written in place on every `Checkpoint` record: a checkpoint can
+        // arrive, later in the same replay, for a message that's since
+        // been acked or dead-lettered — simplest to just keep the latest
+        // per id throughout and apply it once, at the end, only to
+        // whatever's actually still in `pending` by then.
+        let mut checkpoints: HashMap<MessageId, Value> = HashMap::new();
         for record in records {
             match record {
                 WalRecord::Enqueue(id, idempotency_key, item) => {
                     if let Some(key) = &idempotency_key {
                         dedup.insert(key.clone(), id);
                     }
-                    pending.push_back(Pending { id, item, delivery_count: 0, idempotency_key });
+                    pending.push_back(Pending {
+                        id,
+                        item,
+                        delivery_count: 0,
+                        idempotency_key,
+                        checkpoint: None,
+                    });
                 }
                 WalRecord::Ack(id) => {
                     if let Some(index) = pending.iter().position(|entry| entry.id == id)
@@ -286,7 +367,24 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                         dedup.remove(key);
                     }
                 }
+                WalRecord::DeadLettered(id) => {
+                    // Unlike `Ack`, deliberately does *not* touch
+                    // `dedup` — dead-lettering never releases a
+                    // message's idempotency key (see `State::dedup`'s
+                    // docs), and the loop below re-seeds `dedup` from
+                    // the DLQ's own keys regardless, so removing it here
+                    // would just be undone a few lines later anyway.
+                    if let Some(index) = pending.iter().position(|entry| entry.id == id) {
+                        pending.remove(index);
+                    }
+                }
+                WalRecord::Checkpoint(id, state) => {
+                    checkpoints.insert(id, state);
+                }
             }
+        }
+        for entry in &mut pending {
+            entry.checkpoint = checkpoints.remove(&entry.id);
         }
         let dlq = DeadLetterQueue::open(Self::dlq_path(path)).await?;
         // Dead-lettering doesn't release a message's idempotency key —
@@ -427,7 +525,13 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         };
         {
             let mut state = self.state.lock().await;
-            state.pending.push_back(Pending { id, item, delivery_count: 0, idempotency_key });
+            state.pending.push_back(Pending {
+                id,
+                item,
+                delivery_count: 0,
+                idempotency_key,
+                checkpoint: None,
+            });
         }
         self.changed.notify_one();
         Ok(id)
@@ -486,7 +590,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
             let mut state = self.state.lock().await;
             Self::promote_ready_delayed(&mut state);
 
-            if let Some(Pending { id, item, delivery_count, idempotency_key }) =
+            if let Some(Pending { id, item, delivery_count, idempotency_key, checkpoint }) =
                 state.pending.pop_front()
             {
                 let delivery_count = delivery_count + 1;
@@ -499,6 +603,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                         expires_at: Instant::now() + self.visibility_timeout,
                         delivery_count,
                         idempotency_key: idempotency_key.clone(),
+                        checkpoint: checkpoint.clone(),
                     },
                 );
                 drop(state);
@@ -509,7 +614,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 // when its own, possibly-later, timer fires.
                 self.changed.notify_one();
                 let idempotency_key = Self::effective_idempotency_key(id, idempotency_key);
-                return Claim { id, token, idempotency_key, item, delivery_count };
+                return Claim { id, token, idempotency_key, item, delivery_count, checkpoint };
             }
 
             let wake_at = Self::earliest_wake(&state);
@@ -593,9 +698,12 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         let failed_delivery = {
             let mut state = self.state.lock().await;
             match state.leased.remove(&id) {
-                Some(lease) if lease.token == token => {
-                    Some((lease.item, lease.delivery_count, lease.idempotency_key))
-                }
+                Some(lease) if lease.token == token => Some((
+                    lease.item,
+                    lease.delivery_count,
+                    lease.idempotency_key,
+                    lease.checkpoint,
+                )),
                 // Wrong token (a stale nack for an already-redelivered
                 // message) or no lease at all — either way, put back
                 // exactly what we found, unchanged.
@@ -607,13 +715,90 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
             }
         };
 
-        let Some((item, delivery_count, idempotency_key)) = failed_delivery else {
+        let Some((item, delivery_count, idempotency_key, checkpoint)) = failed_delivery else {
             return Ok(false);
         };
 
-        self.resolve_failed_delivery(id, item, delivery_count, idempotency_key, reason).await?;
+        self.resolve_failed_delivery(id, item, delivery_count, idempotency_key, checkpoint, reason)
+            .await?;
         self.changed.notify_one();
         Ok(true)
+    }
+
+    /// Durably records `state` as this message's latest progress,
+    /// without otherwise touching the lease `id`/`token` hold — the
+    /// lease keeps running exactly as it was, still due to expire at the
+    /// same instant, still resolved by the caller's own eventual
+    /// `ack`/`nack`. This is `feature/durable-agent-workflows`' core
+    /// primitive: a multi-step task — chained LLM calls, a
+    /// human-in-the-loop wait — calls this after each step so that if
+    /// the current delivery is lost (the consumer crashes, or the
+    /// caller simply nacks to release the message for a pause that
+    /// might last hours) a later [`claim`](Self::claim) sees `state` in
+    /// [`Claim::checkpoint`] and can resume the task instead of running
+    /// every already-completed step over again.
+    ///
+    /// Only the *latest* `state` per message is kept — a second
+    /// checkpoint call supersedes the first, it doesn't append to it.
+    /// Shaping `state` as, say, `{"completed_steps": [...], ...}` so it
+    /// reads as a full snapshot rather than a delta is the caller's job;
+    /// this method has no opinion on what `state` contains.
+    ///
+    /// Same stale-lease handling as [`ack`](Self::ack)/[`nack`](Self::nack):
+    /// returns `Ok(false)` without effect if `id`/`token` don't match a
+    /// currently-active lease — most likely because it already expired,
+    /// in which case whoever now holds the redelivered message (if
+    /// anyone yet) is the one who gets to decide what happens next, not
+    /// a caller that's already lost the lease race.
+    ///
+    /// There is one narrow, accepted race here, the same shape as the
+    /// ordering tradeoff documented on `resolve_failed_delivery`: the
+    /// lease is checked once before the (async, fsync-backed) WAL write
+    /// and once after, and if it expired in between — this call's own
+    /// lease-holder having taken just long enough to lose the race —
+    /// `state` has already been durably written by the time the second
+    /// check finds a stale lease. This method still returns `Ok(false)`
+    /// in that case (the in-memory lease genuinely wasn't updated), but
+    /// `state` remains in the WAL and will be replayed as the message's
+    /// checkpoint after a future restart regardless. Narrowing that
+    /// window further would mean holding the state lock across the WAL
+    /// write, which this crate's own rule (never hold the state lock
+    /// across an `.await`) rules out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL write fails; `state` is not recorded
+    /// in that case, and the lease's in-memory checkpoint is left
+    /// exactly as it was before this call — a failed checkpoint write
+    /// must not silently look like it succeeded to a caller checking
+    /// `Claim::checkpoint` after a later crash and replay.
+    pub async fn checkpoint(
+        &self,
+        id: MessageId,
+        token: LeaseToken,
+        state: Value,
+    ) -> io::Result<bool> {
+        {
+            let locked = self.state.lock().await;
+            match locked.leased.get(&id) {
+                Some(lease) if lease.token == token => {}
+                _ => return Ok(false),
+            }
+        }
+
+        self.wal.append(&WalRecord::Checkpoint(id, state.clone())).await?;
+
+        let mut locked = self.state.lock().await;
+        match locked.leased.get_mut(&id) {
+            Some(lease) if lease.token == token => {
+                lease.checkpoint = Some(state);
+                Ok(true)
+            }
+            // See this method's docs on the narrow race this covers:
+            // `state` is durably recorded either way, but the in-memory
+            // lease is no longer this caller's to update.
+            _ => Ok(false),
+        }
     }
 
     /// Moves every lease whose visibility timeout has passed to
@@ -640,7 +825,12 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// and a caller blocked in `claim` shouldn't fail because a
     /// different message's DLQ write happened to fail.
     async fn reclaim_expired_leases(&self) {
-        let expired: Vec<(MessageId, T, u32, Option<IdempotencyKey>)> = {
+        // `(MessageId, Leased<T>)` rather than unpacking `Leased` into a
+        // same-shaped tuple here — it already has exactly the fields
+        // this needs (`clippy::type_complexity` agrees: a 5-element
+        // tuple crossed its threshold the moment `checkpoint` joined the
+        // other fields already being threaded through).
+        let expired: Vec<(MessageId, Leased<T>)> = {
             let mut state = self.state.lock().await;
             let now = Instant::now();
             let expired_ids: Vec<MessageId> = state
@@ -654,7 +844,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 .map(|id| {
                     let lease =
                         state.leased.remove(&id).expect("id came from iterating this same map");
-                    (id, lease.item, lease.delivery_count, lease.idempotency_key)
+                    (id, lease)
                 })
                 .collect()
         };
@@ -662,10 +852,17 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         if expired.is_empty() {
             return;
         }
-        for (id, item, delivery_count, idempotency_key) in expired {
+        for (id, lease) in expired {
             let reason = Some("visibility timeout expired".to_string());
             if let Err(error) = self
-                .resolve_failed_delivery(id, item, delivery_count, idempotency_key, reason)
+                .resolve_failed_delivery(
+                    id,
+                    lease.item,
+                    lease.delivery_count,
+                    lease.idempotency_key,
+                    lease.checkpoint,
+                    reason,
+                )
                 .await
             {
                 tracing::error!(
@@ -694,17 +891,41 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// WAL-backed operation in this crate already has (`enqueue`,
     /// `ack`), not a special case invented here.
     ///
+    /// `checkpoint` is dropped, not carried into the [`DeadLetter`], on
+    /// the exhausted path — a deliberate, documented scope cut, not an
+    /// oversight: giving dead letters their own view into a workflow's
+    /// last-saved progress is squarely `feature/llm-assisted-dlq-triage`'s
+    /// job (a later branch whose entire point is making dead letters
+    /// diagnosable), not this one's. On the retry path, `checkpoint`
+    /// *is* carried forward into the [`Delayed`] entry — a message that
+    /// hasn't exhausted its retries yet is still the *same* in-progress
+    /// workflow, not a new one.
+    ///
+    /// The dead-letter path does two durable writes, not one: the DLQ's
+    /// own record, then a [`WalRecord::DeadLettered`] in *this* group's
+    /// main WAL so the message doesn't resurrect as pending on the next
+    /// restart despite also sitting in the DLQ (see [`WalRecord`]'s
+    /// docs). Deliberately in that order, not the reverse: if the
+    /// process crashes between the two, the worst case is the old bug
+    /// this fixes — the message resurrects as pending *and* stays in the
+    /// DLQ, a duplicate an idempotency key makes safe to reprocess.
+    /// Writing the main-WAL record first and crashing before the DLQ
+    /// write would instead permanently lose the message — it would be
+    /// gone from `pending` with nothing durable ever having recorded
+    /// where it went. A duplicate is recoverable; silent loss isn't.
+    ///
     /// # Errors
     ///
-    /// Returns an error only along the dead-letter path, if the DLQ's
-    /// WAL write fails. Scheduling a retry is in-memory only and never
-    /// fails.
+    /// Returns an error along the dead-letter path if either the DLQ's
+    /// write or this group's own `DeadLettered` write fails. Scheduling
+    /// a retry is in-memory only and never fails.
     async fn resolve_failed_delivery(
         &self,
         id: MessageId,
         item: T,
         delivery_count: u32,
         idempotency_key: Option<IdempotencyKey>,
+        checkpoint: Option<Value>,
         reason: Option<String>,
     ) -> io::Result<()> {
         if self.retry_policy.is_exhausted(delivery_count) {
@@ -717,7 +938,8 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                     last_error: reason,
                     dead_lettered_at: Timestamp::now(),
                 })
-                .await
+                .await?;
+            self.wal.append(&WalRecord::DeadLettered(id)).await
         } else {
             let delay = self.retry_policy.delay_for(delivery_count);
             let mut state = self.state.lock().await;
@@ -727,6 +949,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                 delivery_count,
                 available_at: Instant::now() + delay,
                 idempotency_key,
+                checkpoint,
             });
             Ok(())
         }
@@ -750,6 +973,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                     item: entry.item,
                     delivery_count: entry.delivery_count,
                     idempotency_key: entry.idempotency_key,
+                    checkpoint: entry.checkpoint,
                 });
             } else {
                 still_delayed.push(entry);
@@ -900,6 +1124,101 @@ mod tests {
         let reconstructed = super::LeaseToken::from_u64(carried);
 
         assert!(group.ack(claim.id, reconstructed).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_first_claim_has_no_checkpoint() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let claim = group.claim().await;
+        assert_eq!(claim.checkpoint, None);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_is_visible_on_the_next_claim_after_an_explicit_nack() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let first = group.claim().await;
+        let progress = serde_json::json!({"step": 2, "of": 5});
+        assert!(group.checkpoint(first.id, first.token, progress.clone()).await.unwrap());
+
+        // A pause, not a failure — this branch's answer to
+        // human-in-the-loop waits is to release via the existing `nack`
+        // path rather than a dedicated "pause" primitive, with the
+        // checkpoint already saved carrying the progress forward.
+        assert!(group.nack(first.id, first.token, None).await.unwrap());
+
+        let second = group.claim().await;
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.checkpoint, Some(progress));
+    }
+
+    #[tokio::test]
+    async fn only_the_latest_checkpoint_is_kept_not_a_history_of_all_of_them() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let claim = group.claim().await;
+        group.checkpoint(claim.id, claim.token, serde_json::json!({"step": 1})).await.unwrap();
+        group.checkpoint(claim.id, claim.token, serde_json::json!({"step": 2})).await.unwrap();
+        assert!(group.nack(claim.id, claim.token, None).await.unwrap());
+
+        let redelivered = group.claim().await;
+        assert_eq!(redelivered.checkpoint, Some(serde_json::json!({"step": 2})));
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_survives_a_restart_the_same_way_the_message_itself_does() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let progress = serde_json::json!({"step": "chained-llm-call-3"});
+        let id = {
+            let group =
+                ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
+            group.enqueue(1).await.unwrap();
+            let claim = group.claim().await;
+            assert!(group.checkpoint(claim.id, claim.token, progress.clone()).await.unwrap());
+            claim.id
+            // Dropped without ack/nack — simulates the consumer crashing
+            // mid-workflow, the exact scenario this branch is for.
+        };
+
+        let reopened =
+            ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
+        let resumed = reopened.claim().await;
+        assert_eq!(resumed.id, id);
+        assert_eq!(resumed.checkpoint, Some(progress));
+    }
+
+    #[tokio::test]
+    async fn checkpointing_with_a_stale_token_is_rejected_without_effect() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, SHORT_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let first = group.claim().await;
+        tokio::time::sleep(SHORT_TIMEOUT * 3).await;
+        let second = group.claim().await;
+        assert_eq!(second.id, first.id, "same message, redelivered after the first lease expired");
+
+        // `first.token` no longer names an active lease — this must not
+        // silently attribute progress to `second`'s delivery.
+        assert!(!group.checkpoint(first.id, first.token, serde_json::json!("late")).await.unwrap());
+
+        // Prove it didn't corrupt `second`'s lease rather than just
+        // trusting the `false` return: a legitimate checkpoint against
+        // `second`'s own token should still work normally, and the
+        // stale attempt's value must not show up anywhere afterward.
+        let legitimate = serde_json::json!("second's own progress");
+        assert!(group.checkpoint(second.id, second.token, legitimate.clone()).await.unwrap());
+        assert!(group.nack(second.id, second.token, None).await.unwrap());
+        let redelivered = group.claim().await;
+        assert_eq!(redelivered.checkpoint, Some(legitimate));
     }
 
     #[tokio::test]
@@ -1222,6 +1541,32 @@ mod tests {
         assert_eq!(dead_letters[0].item, 42);
         assert_eq!(dead_letters[0].delivery_count, 2);
         assert_eq!(dead_letters[0].last_error.as_deref(), Some("second failure"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_lettered_message_does_not_resurrect_as_pending_after_a_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        {
+            let group =
+                ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, EXHAUST_AFTER_TWO).await.unwrap();
+            group.enqueue(42).await.unwrap();
+            let first = group.claim().await;
+            group.nack(first.id, first.token, Some("f1".to_string())).await.unwrap();
+            let second = group.claim().await;
+            group.nack(second.id, second.token, Some("f2".to_string())).await.unwrap();
+            assert!(group.is_empty().await);
+            assert_eq!(group.dead_letters().await.len(), 1);
+        }
+
+        // Before the DeadLettered WAL record existed, this resurrected the
+        // message as pending on top of it still sitting in the DLQ — a
+        // dead-lettered message is supposed to be a terminal, durable
+        // outcome, not one that only lasts until the next restart.
+        let reopened =
+            ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, EXHAUST_AFTER_TWO).await.unwrap();
+        assert_eq!(reopened.len().await, 0);
+        assert_eq!(reopened.dead_letters().await.len(), 1);
     }
 
     #[tokio::test]

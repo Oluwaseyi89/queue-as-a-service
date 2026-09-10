@@ -1,4 +1,5 @@
-//! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`.
+//! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`,
+//! `checkpoint`.
 //!
 //! This is the branch's whole point — an agent runtime that already
 //! speaks MCP (Claude Code, Claude Desktop, any other MCP client) can
@@ -60,6 +61,19 @@
 //! branch. `ConsumerGroup::open` itself has no such override either
 //! (see its docs) — this interface doesn't add configurability its
 //! underlying engine doesn't already have.
+//!
+//! # `checkpoint` (`feature/durable-agent-workflows`)
+//!
+//! Durably saves progress against a currently-claimed message without
+//! resolving it — the primitive a multi-step agent workflow (chained LLM
+//! calls, a human-in-the-loop pause) needs to resume where it left off
+//! instead of starting over after a crash or a deliberate pause. `claim`
+//! now returns whatever was last checkpointed for a message (`null` if
+//! nothing has been), and a caller pauses a long-running step the same
+//! way it always has — by calling `nack` — with its progress already
+//! saved. See `qaas_core::ConsumerGroup`'s own module docs for the full
+//! reasoning, including why this reuses `nack` rather than adding a
+//! dedicated pause tool.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -236,6 +250,12 @@ struct ClaimResult {
     /// How many times this message has now been delivered, including
     /// this delivery. Starts at 1.
     delivery_count: Option<u32>,
+    /// The latest progress saved via `checkpoint` for this message, if
+    /// any — `null` for a message's first-ever claim, or one that was
+    /// never checkpointed. Present so a resuming workflow can pick up
+    /// where a previous delivery (crashed, or paused via `nack`) left
+    /// off instead of redoing already-completed steps.
+    checkpoint: Option<serde_json::Value>,
 }
 
 /// Arguments for the `ack` tool.
@@ -278,6 +298,35 @@ struct NackParams {
 struct NackResult {
     /// Same stale-lease semantics as [`AckResult::acked`].
     nacked: bool,
+}
+
+/// Arguments for the `checkpoint` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CheckpointParams {
+    /// Which queue the message was claimed from.
+    queue: String,
+    /// The message id from a prior `claim` call.
+    message_id: String,
+    /// The lease token from that same `claim` call.
+    lease_token: u64,
+    /// This workflow's current progress, any JSON value. Shape it as a
+    /// full snapshot of where the task is, not a delta — only the
+    /// latest checkpoint per message is kept, and it entirely replaces
+    /// whatever was saved before.
+    state: serde_json::Value,
+}
+
+/// Result of the `checkpoint` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct CheckpointResult {
+    /// Same stale-lease semantics as [`AckResult::acked`] — `false`
+    /// means this id/token pair no longer matched an active lease, and
+    /// `state` was not associated with this delivery. Note that in one
+    /// narrow race (the lease expiring in the moment between this call's
+    /// internal checks) `state` may still have been durably recorded
+    /// even though this returns `false` — see `qaas_core::ConsumerGroup::checkpoint`'s
+    /// own docs.
+    checkpointed: bool,
 }
 
 /// The MCP server itself. Cheap to clone — the only state is an `Arc`'d
@@ -348,6 +397,7 @@ impl QaasMcpServer {
                 idempotency_key: Some(claim.idempotency_key.as_str().to_string()),
                 payload: Some(claim.item),
                 delivery_count: Some(claim.delivery_count),
+                checkpoint: claim.checkpoint,
             })),
             Err(_elapsed) => Ok(Json(ClaimResult {
                 available: false,
@@ -356,6 +406,7 @@ impl QaasMcpServer {
                 idempotency_key: None,
                 payload: None,
                 delivery_count: None,
+                checkpoint: None,
             })),
         }
     }
@@ -392,6 +443,30 @@ impl QaasMcpServer {
             .map_err(|error| io_error_to_mcp(&error))?;
         Ok(Json(NackResult { nacked }))
     }
+
+    /// Durably saves progress against a still-claimed message, without
+    /// resolving it — the lease keeps running unchanged.
+    #[tool(
+        description = "Durably save progress against a still-claimed message, without resolving \
+                        it - the lease keeps running unchanged. Call this after each step of a \
+                        multi-step task so a future claim (after a crash, or after you nack to \
+                        pause) can resume from here instead of starting over. Only the latest \
+                        state per message is kept."
+    )]
+    async fn checkpoint(
+        &self,
+        Parameters(params): Parameters<CheckpointParams>,
+    ) -> Result<Json<CheckpointResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let token = LeaseToken::from_u64(params.lease_token);
+
+        let checkpointed = group
+            .checkpoint(message_id, token, params.state)
+            .await
+            .map_err(|error| io_error_to_mcp(&error))?;
+        Ok(Json(CheckpointResult { checkpointed }))
+    }
 }
 
 #[tool_handler(
@@ -399,7 +474,11 @@ impl QaasMcpServer {
                     queue (created automatically on first use), claim to receive the next \
                     available message (waiting up to wait_ms), and ack once you've finished it \
                     successfully — or nack to release it for retry, optionally recording why it \
-                    failed. Every queue is independent; pick a queue name that groups related work."
+                    failed. Every queue is independent; pick a queue name that groups related \
+                    work. For a multi-step task, call checkpoint after each step to durably save \
+                    progress; a later claim of the same message (after a crash, or after you \
+                    nack to pause) returns that progress so you can resume instead of starting \
+                    over."
 )]
 impl ServerHandler for QaasMcpServer {}
 
@@ -451,6 +530,7 @@ mod tests {
         assert_eq!(claimed.message_id, Some(enqueued.message_id.clone()));
         assert_eq!(claimed.payload, Some(json!({"item": "widget"})));
         assert_eq!(claimed.delivery_count, Some(1));
+        assert_eq!(claimed.checkpoint, None);
 
         let acked = server
             .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
@@ -462,6 +542,95 @@ mod tests {
             .unwrap()
             .0;
         assert!(acked.acked);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_is_visible_on_the_next_claim_after_a_pausing_nack() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "workflows".to_string(),
+                payload: json!("start the task"),
+                idempotency_key: None,
+            }))
+            .await
+            .unwrap();
+
+        let first = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "workflows".to_string(),
+                wait_ms: Some(100),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let progress = json!({"completed_steps": ["fetch", "summarize"]});
+        let checkpointed = server
+            .checkpoint(rmcp::handler::server::wrapper::Parameters(super::CheckpointParams {
+                queue: "workflows".to_string(),
+                message_id: first.message_id.clone().unwrap(),
+                lease_token: first.lease_token.unwrap(),
+                state: progress.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(checkpointed.checkpointed);
+
+        // Pausing — e.g. waiting on a human — releases the message the
+        // same way a failure does (see the module docs for why), but the
+        // checkpoint already saved should still be there for whoever
+        // claims it next.
+        let nacked = server
+            .nack(rmcp::handler::server::wrapper::Parameters(super::NackParams {
+                queue: "workflows".to_string(),
+                message_id: first.message_id.unwrap(),
+                lease_token: first.lease_token.unwrap(),
+                reason: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(nacked.nacked);
+
+        // The registry opens queues with `RetryPolicy::DEFAULT`, whose
+        // 500ms base backoff delay means the nacked message isn't
+        // immediately claimable again — `wait_ms` here needs to be
+        // comfortably longer than that, not just longer than zero, or
+        // this becomes exactly the kind of timing-sensitive test that's
+        // flaky under load rather than one that's reliably correct.
+        let resumed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "workflows".to_string(),
+                wait_ms: Some(2000),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(resumed.available, "should not still be waiting out the retry backoff");
+        assert_eq!(resumed.checkpoint, Some(progress));
+    }
+
+    #[tokio::test]
+    async fn checkpointing_with_a_stale_lease_token_is_rejected() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .checkpoint(rmcp::handler::server::wrapper::Parameters(super::CheckpointParams {
+                queue: "workflows".to_string(),
+                message_id: qaas_types::MessageId::new().to_string(),
+                lease_token: 0,
+                state: json!("never claimed"),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!result.checkpointed);
     }
 
     #[tokio::test]
