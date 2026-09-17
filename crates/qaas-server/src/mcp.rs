@@ -1,5 +1,5 @@
 //! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`,
-//! `checkpoint`.
+//! `checkpoint`, `configure_admission`, `admission_status`.
 //!
 //! This is the branch's whole point — an agent runtime that already
 //! speaks MCP (Claude Code, Claude Desktop, any other MCP client) can
@@ -74,13 +74,46 @@
 //! saved. See `qaas_core::ConsumerGroup`'s own module docs for the full
 //! reasoning, including why this reuses `nack` rather than adding a
 //! dedicated pause tool.
+//!
+//! # Token/cost admission control (`feature/token-cost-aware-admission`)
+//!
+//! Every queue gets its own [`qaas_core::AdmissionController`] (see that
+//! module's docs for the sliding-window algorithm), starting unlimited —
+//! admission control is opt-in per queue via `configure_admission`, not a
+//! surprise default every queue this server already had suddenly has to
+//! satisfy. Two different checks against the *same* window, not one:
+//!
+//! - `enqueue` takes optional `estimated_tokens`/`estimated_cost`
+//!   arguments — a producer's up-front estimate of what a task will cost
+//!   — and admits (recording them) or refuses the enqueue outright if
+//!   either would exceed the queue's ceiling this window. Omitting both
+//!   defaults to zero cost, so existing callers that don't know or care
+//!   about token economics are unaffected.
+//! - `claim` checks, read-only, whether the queue is *currently* within
+//!   both ceilings before even attempting to claim anything, refusing
+//!   (`available: false, throttled: true`) without waiting out `wait_ms`
+//!   at all if not. This is deliberately not a second deduction of the
+//!   claimed message's own cost — `enqueue` already recorded that
+//!   estimate — it exists to catch an operator having *lowered* a
+//!   queue's budget live (`configure_admission`) below what's already
+//!   been admitted this window: `enqueue` alone wouldn't stop a consumer
+//!   from continuing to burn through work that was admitted under a more
+//!   generous, since-tightened ceiling.
+//!
+//! `configure_admission` and `admission_status` are the only tools this
+//! server has that aren't producer/consumer delivery operations — the
+//! closest thing to an admin surface this project has, since there's no
+//! HTTP control plane yet (`feature/api-auth`, later, is what a real one
+//! would need first).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use qaas_core::{ConsumerGroup, LeaseToken, RetryPolicy};
+use qaas_core::{
+    AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, LeaseToken, RetryPolicy,
+};
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -149,7 +182,24 @@ fn io_error_to_mcp(error: &std::io::Error) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
 
-/// Lazily opens and holds one [`ConsumerGroup`] per queue name.
+/// Maps an [`AdmissionDecision::Denied`] onto the MCP error shape.
+/// [`ErrorCode::INVALID_REQUEST`](rmcp::model::ErrorCode) rather than
+/// `INVALID_PARAMS`: the request itself is well-formed, just not
+/// currently admissible — the same distinction a real HTTP 429 draws
+/// from a 400. `retry_after` travels in the structured `data` field
+/// (seconds, or absent if retrying can never help — see
+/// [`AdmissionDecision::Denied`]'s own docs) so a calling agent can act
+/// on it programmatically instead of having to parse it back out of
+/// `reason`'s prose.
+fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> ErrorData {
+    ErrorData::invalid_request(
+        reason.to_string(),
+        Some(serde_json::json!({ "retry_after_seconds": retry_after.map(|d| d.as_secs_f64()) })),
+    )
+}
+
+/// Lazily opens and holds one [`ConsumerGroup`] and one
+/// [`AdmissionController`] per queue name.
 ///
 /// A `ConsumerGroup` owns a WAL file and does its own internal locking
 /// once opened, so this registry's own lock is only ever held for the
@@ -157,15 +207,21 @@ fn io_error_to_mcp(error: &std::io::Error) -> ErrorData {
 /// `ConsumerGroup` operation itself. Re-opening a `ConsumerGroup` on
 /// every tool call (rather than caching it here) would mean replaying
 /// its WAL from scratch every time, which defeats the entire point of
-/// it being durable, in-process state.
+/// it being durable, in-process state. `AdmissionController` has no WAL
+/// to replay — its sliding window is deliberately in-memory only, the
+/// same as `qaas-core`'s own docs describe for `circuit_breaker` — but
+/// it's cached here for the same reason: a fresh, empty window on every
+/// tool call would mean admission control never actually throttled
+/// anything.
 struct QueueRegistry {
     data_dir: PathBuf,
     groups: Mutex<HashMap<String, Arc<ConsumerGroup<serde_json::Value>>>>,
+    admission: Mutex<HashMap<String, Arc<AdmissionController>>>,
 }
 
 impl QueueRegistry {
     fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, groups: Mutex::new(HashMap::new()) }
+        Self { data_dir, groups: Mutex::new(HashMap::new()), admission: Mutex::new(HashMap::new()) }
     }
 
     /// Returns the queue named `name`, opening it (creating its WAL file
@@ -189,6 +245,23 @@ impl QueueRegistry {
         groups.insert(name.to_string(), Arc::clone(&group));
         Ok(group)
     }
+
+    /// Returns the admission controller for `name`, creating one with
+    /// [`AdmissionConfig::UNLIMITED`] on first reference — a queue no one
+    /// has ever called `configure_admission` on is never throttled, not
+    /// throttled by some undocumented default.
+    async fn admission(&self, name: &str) -> Result<Arc<AdmissionController>, ErrorData> {
+        validate_queue_name(name)?;
+
+        let mut controllers = self.admission.lock().await;
+        if let Some(controller) = controllers.get(name) {
+            return Ok(Arc::clone(controller));
+        }
+
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig::UNLIMITED));
+        controllers.insert(name.to_string(), Arc::clone(&controller));
+        Ok(controller)
+    }
 }
 
 /// Arguments for the `enqueue` tool.
@@ -205,6 +278,16 @@ struct EnqueueParams {
     /// id — safe to retry a timed-out enqueue call without risking a
     /// duplicate message.
     idempotency_key: Option<String>,
+    /// Estimated tokens this task is expected to cost once claimed and
+    /// executed — checked against the queue's token budget (see
+    /// `configure_admission`) before the enqueue is allowed to proceed.
+    /// Defaults to 0 (no contribution to, or gating by, the token
+    /// budget) if omitted.
+    estimated_tokens: Option<u64>,
+    /// Estimated dollar cost this task is expected to incur — checked
+    /// against the queue's cost ceiling the same way `estimated_tokens`
+    /// is checked against its token budget. Defaults to 0.0 if omitted.
+    estimated_cost: Option<f64>,
 }
 
 /// Result of the `enqueue` tool.
@@ -213,6 +296,14 @@ struct EnqueueResult {
     /// The enqueued message's id. A later `claim` returns this same id
     /// when it delivers the message; pass it to `ack`/`nack` then.
     message_id: String,
+    /// Tokens left in the queue's budget for the rest of this window
+    /// after admitting this enqueue, if a token budget is configured for
+    /// it (`null` otherwise).
+    tokens_remaining: Option<u64>,
+    /// Dollars left in the queue's cost ceiling for the rest of this
+    /// window after admitting this enqueue, if a cost ceiling is
+    /// configured for it (`null` otherwise).
+    cost_remaining: Option<f64>,
 }
 
 /// Arguments for the `claim` tool.
@@ -229,11 +320,19 @@ struct ClaimParams {
 /// Result of the `claim` tool.
 #[derive(Debug, Serialize, JsonSchema)]
 struct ClaimResult {
-    /// `false` means the wait window elapsed with nothing claimable —
-    /// an empty queue, or everything currently leased to other
-    /// consumers. Not an error; every other field is `null` in that
-    /// case.
+    /// `false` means nothing was claimed — either the wait window
+    /// elapsed with nothing claimable (an empty queue, or everything
+    /// currently leased to other consumers), or the queue is currently
+    /// over its token/cost budget (`throttled` distinguishes the two).
+    /// Not an error either way; every other field is `null` in both
+    /// cases.
     available: bool,
+    /// `true` means `available: false` is because the queue is
+    /// currently over its admission budget, not because there was
+    /// nothing to claim — `wait_ms` wasn't even waited out in this case,
+    /// since there's no reason to poll a queue that's throttled
+    /// regardless of what becomes claimable. See `configure_admission`.
+    throttled: bool,
     /// The claimed message's id. Present only when `available` is true.
     message_id: Option<String>,
     /// This delivery's lease token. Pass it back to `ack`/`nack`
@@ -329,6 +428,64 @@ struct CheckpointResult {
     checkpointed: bool,
 }
 
+/// Arguments for the `configure_admission` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureAdmissionParams {
+    /// Which queue to configure. Opened automatically if it doesn't
+    /// exist yet, same as every other tool here.
+    queue: String,
+    /// Maximum total tokens allowed within any trailing window on this
+    /// queue. `null` (the default if omitted) means no token ceiling.
+    tokens_per_window: Option<u64>,
+    /// Maximum total dollars allowed within any trailing window on this
+    /// queue. `null` (the default if omitted) means no cost ceiling.
+    cost_ceiling_per_window: Option<f64>,
+    /// How far back "within the window" looks, in seconds. Defaults to
+    /// 3600 (one hour) if omitted.
+    window_seconds: Option<u64>,
+}
+
+/// Result of the `configure_admission` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ConfigureAdmissionResult {
+    /// The token ceiling now in effect for this queue (`null` if none).
+    tokens_per_window: Option<u64>,
+    /// The cost ceiling now in effect for this queue (`null` if none).
+    cost_ceiling_per_window: Option<f64>,
+    /// The window, in seconds, now in effect for this queue.
+    window_seconds: u64,
+}
+
+/// Arguments for the `admission_status` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AdmissionStatusParams {
+    /// Which queue to report on.
+    queue: String,
+}
+
+/// Result of the `admission_status` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct AdmissionStatusResult {
+    /// The token ceiling currently configured for this queue (`null` if
+    /// none — never throttled on tokens).
+    tokens_per_window: Option<u64>,
+    /// The cost ceiling currently configured for this queue (`null` if
+    /// none — never throttled on cost).
+    cost_ceiling_per_window: Option<f64>,
+    /// The window, in seconds, currently configured for this queue.
+    window_seconds: u64,
+    /// Tokens admitted within the current window, as of now.
+    tokens_used: u64,
+    /// Dollars admitted within the current window, as of now.
+    cost_used: f64,
+    /// Tokens still available this window (`null` if no token ceiling
+    /// is configured — nothing to be "remaining" against).
+    tokens_remaining: Option<u64>,
+    /// Dollars still available this window (`null` if no cost ceiling
+    /// is configured).
+    cost_remaining: Option<f64>,
+}
+
 /// The MCP server itself. Cheap to clone — the only state is an `Arc`'d
 /// [`QueueRegistry`] — which `rmcp` relies on internally when handling
 /// more than one tool call concurrently over the same connection.
@@ -358,11 +515,27 @@ impl QaasMcpServer {
         Parameters(params): Parameters<EnqueueParams>,
     ) -> Result<Json<EnqueueResult>, ErrorData> {
         let group = self.registry.get(&params.queue).await?;
+        let admission = self.registry.admission(&params.queue).await?;
 
+        // Validated before admission is consulted: a malformed request
+        // shouldn't spend any of the queue's budget on its way to being
+        // rejected anyway.
         let idempotency_key =
             params.idempotency_key.map(qaas_types::IdempotencyKey::new).transpose().map_err(
                 |_| ErrorData::invalid_params("idempotency_key must not be empty", None),
             )?;
+
+        let (tokens_remaining, cost_remaining) = match admission
+            .try_admit(params.estimated_tokens.unwrap_or(0), params.estimated_cost.unwrap_or(0.0))
+            .await
+        {
+            AdmissionDecision::Admitted { tokens_remaining, cost_remaining } => {
+                (tokens_remaining, cost_remaining)
+            }
+            AdmissionDecision::Denied { reason, retry_after } => {
+                return Err(admission_denied_to_mcp(&reason, retry_after));
+            }
+        };
 
         let message_id = match idempotency_key {
             Some(key) => group.enqueue_with_key(params.payload, key).await,
@@ -370,7 +543,11 @@ impl QaasMcpServer {
         }
         .map_err(|error| io_error_to_mcp(&error))?;
 
-        Ok(Json(EnqueueResult { message_id: message_id.to_string() }))
+        Ok(Json(EnqueueResult {
+            message_id: message_id.to_string(),
+            tokens_remaining,
+            cost_remaining,
+        }))
     }
 
     /// Claims the next available message from a named queue, waiting up
@@ -386,12 +563,32 @@ impl QaasMcpServer {
         Parameters(params): Parameters<ClaimParams>,
     ) -> Result<Json<ClaimResult>, ErrorData> {
         let group = self.registry.get(&params.queue).await?;
+        let admission = self.registry.admission(&params.queue).await?;
+
+        // Checked before attempting to claim at all, and not waited out
+        // the way an empty queue is — see the module docs for why this
+        // is a read-only re-check of enqueue's own admission, not a
+        // second deduction of the same task's cost.
+        if !admission.has_headroom().await {
+            return Ok(Json(ClaimResult {
+                available: false,
+                throttled: true,
+                message_id: None,
+                lease_token: None,
+                idempotency_key: None,
+                payload: None,
+                delivery_count: None,
+                checkpoint: None,
+            }));
+        }
+
         let wait =
             params.wait_ms.map_or(DEFAULT_CLAIM_WAIT, Duration::from_millis).min(MAX_CLAIM_WAIT);
 
         match tokio::time::timeout(wait, group.claim()).await {
             Ok(claim) => Ok(Json(ClaimResult {
                 available: true,
+                throttled: false,
                 message_id: Some(claim.id.to_string()),
                 lease_token: Some(claim.token.as_u64()),
                 idempotency_key: Some(claim.idempotency_key.as_str().to_string()),
@@ -401,6 +598,7 @@ impl QaasMcpServer {
             })),
             Err(_elapsed) => Ok(Json(ClaimResult {
                 available: false,
+                throttled: false,
                 message_id: None,
                 lease_token: None,
                 idempotency_key: None,
@@ -467,6 +665,59 @@ impl QaasMcpServer {
             .map_err(|error| io_error_to_mcp(&error))?;
         Ok(Json(CheckpointResult { checkpointed }))
     }
+
+    /// Sets or clears a queue's token/cost admission budget.
+    #[tool(description = "Set (or clear) a queue's token/cost admission budget: a sliding window \
+                        that continuously refills as time passes, not a one-time allowance. \
+                        Omitting both tokens_per_window and cost_ceiling_per_window disables \
+                        throttling for this queue. Takes effect immediately, including for usage \
+                        already admitted this window - see admission_status to inspect current usage.")]
+    async fn configure_admission(
+        &self,
+        Parameters(params): Parameters<ConfigureAdmissionParams>,
+    ) -> Result<Json<ConfigureAdmissionResult>, ErrorData> {
+        let admission = self.registry.admission(&params.queue).await?;
+        let window = Duration::from_secs(params.window_seconds.unwrap_or(3600));
+        let config = AdmissionConfig {
+            tokens_per_window: params.tokens_per_window,
+            cost_ceiling_per_window: params.cost_ceiling_per_window,
+            window,
+        };
+        admission.set_config(config).await;
+
+        Ok(Json(ConfigureAdmissionResult {
+            tokens_per_window: config.tokens_per_window,
+            cost_ceiling_per_window: config.cost_ceiling_per_window,
+            window_seconds: window.as_secs(),
+        }))
+    }
+
+    /// Reports a queue's current admission configuration and usage.
+    #[tool(description = "Report a queue's current token/cost admission configuration and usage \
+                        within the active window - how much budget is configured, how much has \
+                        been used, and how much remains.")]
+    async fn admission_status(
+        &self,
+        Parameters(params): Parameters<AdmissionStatusParams>,
+    ) -> Result<Json<AdmissionStatusResult>, ErrorData> {
+        let admission = self.registry.admission(&params.queue).await?;
+        let config = admission.config().await;
+        let usage = admission.usage().await;
+
+        Ok(Json(AdmissionStatusResult {
+            tokens_per_window: config.tokens_per_window,
+            cost_ceiling_per_window: config.cost_ceiling_per_window,
+            window_seconds: config.window.as_secs(),
+            tokens_used: usage.tokens_used,
+            cost_used: usage.cost_used,
+            tokens_remaining: config
+                .tokens_per_window
+                .map(|limit| limit.saturating_sub(usage.tokens_used)),
+            cost_remaining: config
+                .cost_ceiling_per_window
+                .map(|ceiling| (ceiling - usage.cost_used).max(0.0)),
+        }))
+    }
 }
 
 #[tool_handler(
@@ -478,7 +729,11 @@ impl QaasMcpServer {
                     work. For a multi-step task, call checkpoint after each step to durably save \
                     progress; a later claim of the same message (after a crash, or after you \
                     nack to pause) returns that progress so you can resume instead of starting \
-                    over."
+                    over. Use configure_admission to set a queue's token/cost budget (a sliding \
+                    window, off by default) and admission_status to check current usage; enqueue \
+                    can decline a task that would exceed the budget (pass estimated_tokens / \
+                    estimated_cost to be checked), and claim reports throttled: true instead of \
+                    waiting when the queue is currently over budget."
 )]
 impl ServerHandler for QaasMcpServer {}
 
@@ -513,6 +768,8 @@ mod tests {
                 queue: "orders".to_string(),
                 payload: json!({"item": "widget"}),
                 idempotency_key: None,
+                estimated_tokens: None,
+                estimated_cost: None,
             }))
             .await
             .unwrap()
@@ -554,6 +811,8 @@ mod tests {
                 queue: "workflows".to_string(),
                 payload: json!("start the task"),
                 idempotency_key: None,
+                estimated_tokens: None,
+                estimated_cost: None,
             }))
             .await
             .unwrap();
@@ -679,6 +938,8 @@ mod tests {
             queue: "orders".to_string(),
             payload: json!("payload"),
             idempotency_key: Some("dedup-1".to_string()),
+            estimated_tokens: None,
+            estimated_cost: None,
         };
 
         let first =
@@ -699,6 +960,8 @@ mod tests {
                 queue: "../escape".to_string(),
                 payload: json!("x"),
                 idempotency_key: None,
+                estimated_tokens: None,
+                estimated_cost: None,
             }))
             .await;
 
@@ -709,5 +972,160 @@ mod tests {
             panic!("expected an error, got a successful enqueue");
         };
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_queue_is_never_throttled() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let enqueued = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "orders".to_string(),
+                payload: json!("x"),
+                idempotency_key: None,
+                estimated_tokens: Some(1_000_000_000),
+                estimated_cost: Some(1_000_000.0),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(enqueued.tokens_remaining, None);
+        assert_eq!(enqueued.cost_remaining, None);
+    }
+
+    #[tokio::test]
+    async fn enqueue_is_denied_once_the_configured_token_budget_would_be_exceeded() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        server
+            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+                super::ConfigureAdmissionParams {
+                    queue: "orders".to_string(),
+                    tokens_per_window: Some(100),
+                    cost_ceiling_per_window: None,
+                    window_seconds: Some(60),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let first = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "orders".to_string(),
+                payload: json!("first"),
+                idempotency_key: None,
+                estimated_tokens: Some(80),
+                estimated_cost: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(first.tokens_remaining, Some(20));
+
+        let result = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "orders".to_string(),
+                payload: json!("second"),
+                idempotency_key: None,
+                estimated_tokens: Some(50),
+                estimated_cost: None,
+            }))
+            .await;
+
+        let Err(error) = result else {
+            panic!("expected the second enqueue to be denied");
+        };
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+        assert!(error.message.contains("130 tokens"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn claim_reports_throttled_instead_of_waiting_when_the_queue_is_over_budget() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "orders".to_string(),
+                payload: json!("a real message, sitting right there"),
+                idempotency_key: None,
+                estimated_tokens: None,
+                estimated_cost: None,
+            }))
+            .await
+            .unwrap();
+
+        server
+            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+                super::ConfigureAdmissionParams {
+                    queue: "orders".to_string(),
+                    tokens_per_window: Some(0),
+                    cost_ceiling_per_window: None,
+                    window_seconds: Some(60),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "orders".to_string(),
+                wait_ms: Some(50),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        // A real message is sitting there, unclaimed by anyone — this is
+        // specifically the throttled outcome, not "the queue was empty."
+        assert!(!claimed.available);
+        assert!(claimed.throttled);
+    }
+
+    #[tokio::test]
+    async fn admission_status_reports_configuration_and_live_usage() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        server
+            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+                super::ConfigureAdmissionParams {
+                    queue: "orders".to_string(),
+                    tokens_per_window: Some(1000),
+                    cost_ceiling_per_window: Some(5.0),
+                    window_seconds: Some(120),
+                },
+            ))
+            .await
+            .unwrap();
+
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: "orders".to_string(),
+                payload: json!("x"),
+                idempotency_key: None,
+                estimated_tokens: Some(200),
+                estimated_cost: Some(1.5),
+            }))
+            .await
+            .unwrap();
+
+        let status = server
+            .admission_status(rmcp::handler::server::wrapper::Parameters(
+                super::AdmissionStatusParams { queue: "orders".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(status.tokens_per_window, Some(1000));
+        assert_eq!(status.cost_ceiling_per_window, Some(5.0));
+        assert_eq!(status.window_seconds, 120);
+        assert_eq!(status.tokens_used, 200);
+        assert!((status.cost_used - 1.5).abs() < f64::EPSILON, "{}", status.cost_used);
+        assert_eq!(status.tokens_remaining, Some(800));
+        assert_eq!(status.cost_remaining, Some(3.5));
     }
 }
