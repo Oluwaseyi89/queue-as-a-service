@@ -1,5 +1,6 @@
 //! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`,
-//! `checkpoint`, `configure_admission`, `admission_status`.
+//! `checkpoint`, `configure_admission`, `admission_status`,
+//! `configure_route`.
 //!
 //! This is the branch's whole point — an agent runtime that already
 //! speaks MCP (Claude Code, Claude Desktop, any other MCP client) can
@@ -105,6 +106,46 @@
 //! closest thing to an admin surface this project has, since there's no
 //! HTTP control plane yet (`feature/api-auth`, later, is what a real one
 //! would need first).
+//!
+//! # Semantic dedup and routing (`feature/semantic-dedup-routing`)
+//!
+//! `enqueue`'s `queue` argument is now optional, and it gains a new
+//! optional `embedding` argument — a caller-computed vector (this crate
+//! has no embedding model of its own; see [`qaas_core::semantic`]'s own
+//! docs for why) representing the task's content. Two independent uses
+//! of the same idea, each backed by its own
+//! [`qaas_core::EmbeddingIndex`]:
+//!
+//! - **Dedup**: when `embedding` is given, it's checked against every
+//!   other embedding recently seen on the *target* queue (within
+//!   [`DEDUP_TTL`], regardless of whether the message that submitted it
+//!   is still pending, leased, or even already acked — see this
+//!   module's own registry docs for exactly what "recently" bounds).
+//!   A match at or above [`DEDUP_SIMILARITY_THRESHOLD`] collapses the
+//!   enqueue: nothing new is written, and the *existing* near-duplicate's
+//!   id comes back instead, flagged `deduplicated: true` — the same
+//!   "safe to retry, no duplicate created" contract
+//!   [`enqueue_with_key`](qaas_core::ConsumerGroup::enqueue_with_key)
+//!   already gives an exact idempotency-key match, just approximate
+//!   instead of exact, and catching duplicates across callers that never
+//!   shared an idempotency key in the first place — precisely the
+//!   "multiple agents independently queue overlapping work" scenario
+//!   `Plan.md`'s line for this branch names.
+//! - **Routing**: when `queue` is omitted, `embedding` is required, and
+//!   is matched instead against every queue's own descriptor embedding
+//!   (set via `configure_route`) — the enqueue lands in whichever
+//!   registered queue's descriptor is closest, with no threshold (unlike
+//!   dedup, routing always picks *something* if any route exists at
+//!   all — there's no "not similar enough" outcome for "which specialized
+//!   consumer should get this," only "which is the best of the ones
+//!   available"). Omitting `queue` with no routes registered, or with
+//!   no `embedding` given either, is a request the server can't fulfill
+//!   and rejects outright.
+//!
+//! `DEDUP_SIMILARITY_THRESHOLD` and `DEDUP_TTL` are fixed constants in
+//! this branch, not configurable per queue — the same "doesn't add
+//! configurability its underlying engine doesn't already have" stance
+//! `VISIBILITY_TIMEOUT` already takes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -112,7 +153,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use qaas_core::{
-    AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, LeaseToken, RetryPolicy,
+    AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, Embedding,
+    EmbeddingIndex, LeaseToken, RetryPolicy,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
@@ -136,6 +178,25 @@ const MAX_CLAIM_WAIT: Duration = Duration::from_secs(60);
 /// The visibility timeout every queue this server opens is given. Not
 /// configurable per-queue in this branch — see the module docs.
 const VISIBILITY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cosine similarity at or above which two tasks on the same queue are
+/// treated as near-duplicates. `0.95` is a common real-world starting
+/// point for "these two embeddings represent the same underlying
+/// content" with typical sentence/document embedding models — high
+/// enough that genuinely different tasks essentially never collide,
+/// while still catching paraphrased near-duplicates that an exact
+/// idempotency-key match never would.
+const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.95;
+
+/// How long an enqueued task's embedding stays eligible for dedup
+/// matching. Ten minutes: long enough to catch the scenario `Plan.md`'s
+/// line for this branch actually names — several agents independently
+/// noticing the same work and queuing it within a short window of each
+/// other — without keeping every task's embedding around indefinitely.
+/// See [`EmbeddingIndex`]'s own docs for why a TTL exists here at all
+/// (this is dedup's safety net for messages this server can't observe
+/// leaving the live queue any other way).
+const DEDUP_TTL: Duration = Duration::from_secs(600);
 
 /// Rejects a queue name that would resolve to anything other than a
 /// single file directly under the registry's data directory.
@@ -198,8 +259,10 @@ fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> Error
     )
 }
 
-/// Lazily opens and holds one [`ConsumerGroup`] and one
-/// [`AdmissionController`] per queue name.
+/// Lazily opens and holds one [`ConsumerGroup`], one
+/// [`AdmissionController`], and one dedup [`EmbeddingIndex`] per queue
+/// name, plus a single registry-wide [`EmbeddingIndex`] of every queue's
+/// routing descriptor.
 ///
 /// A `ConsumerGroup` owns a WAL file and does its own internal locking
 /// once opened, so this registry's own lock is only ever held for the
@@ -207,21 +270,28 @@ fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> Error
 /// `ConsumerGroup` operation itself. Re-opening a `ConsumerGroup` on
 /// every tool call (rather than caching it here) would mean replaying
 /// its WAL from scratch every time, which defeats the entire point of
-/// it being durable, in-process state. `AdmissionController` has no WAL
-/// to replay — its sliding window is deliberately in-memory only, the
-/// same as `qaas-core`'s own docs describe for `circuit_breaker` — but
-/// it's cached here for the same reason: a fresh, empty window on every
-/// tool call would mean admission control never actually throttled
-/// anything.
+/// it being durable, in-process state. `AdmissionController` and
+/// `EmbeddingIndex` have no WAL to replay — both are deliberately
+/// in-memory only (see their own docs) — but are cached here for the
+/// same reason: a fresh, empty one on every tool call would mean neither
+/// ever actually did anything.
 struct QueueRegistry {
     data_dir: PathBuf,
     groups: Mutex<HashMap<String, Arc<ConsumerGroup<serde_json::Value>>>>,
     admission: Mutex<HashMap<String, Arc<AdmissionController>>>,
+    dedup: Mutex<HashMap<String, Arc<EmbeddingIndex<qaas_types::MessageId>>>>,
+    routes: EmbeddingIndex<String>,
 }
 
 impl QueueRegistry {
     fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, groups: Mutex::new(HashMap::new()), admission: Mutex::new(HashMap::new()) }
+        Self {
+            data_dir,
+            groups: Mutex::new(HashMap::new()),
+            admission: Mutex::new(HashMap::new()),
+            dedup: Mutex::new(HashMap::new()),
+            routes: EmbeddingIndex::new(None),
+        }
     }
 
     /// Returns the queue named `name`, opening it (creating its WAL file
@@ -262,14 +332,36 @@ impl QueueRegistry {
         controllers.insert(name.to_string(), Arc::clone(&controller));
         Ok(controller)
     }
+
+    /// Returns `name`'s dedup index, creating an empty, [`DEDUP_TTL`]'d
+    /// one on first reference.
+    async fn dedup(
+        &self,
+        name: &str,
+    ) -> Result<Arc<EmbeddingIndex<qaas_types::MessageId>>, ErrorData> {
+        validate_queue_name(name)?;
+
+        let mut indexes = self.dedup.lock().await;
+        if let Some(index) = indexes.get(name) {
+            return Ok(Arc::clone(index));
+        }
+
+        let index = Arc::new(EmbeddingIndex::new(Some(DEDUP_TTL)));
+        indexes.insert(name.to_string(), Arc::clone(&index));
+        Ok(index)
+    }
 }
 
 /// Arguments for the `enqueue` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EnqueueParams {
     /// Which queue to enqueue onto. Opened automatically if it doesn't
-    /// exist yet — there's no separate "create queue" step.
-    queue: String,
+    /// exist yet — there's no separate "create queue" step. Optional if
+    /// `embedding` is given: omitting `queue` asks the server to route
+    /// this task to whichever registered queue's descriptor (see
+    /// `configure_route`) is the closest match instead of naming one
+    /// directly.
+    queue: Option<String>,
     /// The message payload. Any JSON value; QaaS doesn't interpret it.
     payload: serde_json::Value,
     /// Optional caller-supplied deduplication key. An enqueue reusing a
@@ -288,21 +380,46 @@ struct EnqueueParams {
     /// against the queue's cost ceiling the same way `estimated_tokens`
     /// is checked against its token budget. Defaults to 0.0 if omitted.
     estimated_cost: Option<f64>,
+    /// A caller-computed embedding representing this task's content —
+    /// any non-empty vector of finite numbers, from whatever embedding
+    /// model the caller already has access to. Used for near-duplicate
+    /// detection on the target queue, and — if `queue` is omitted — to
+    /// pick which queue that is in the first place. See the module docs
+    /// for the full behavior.
+    embedding: Option<Vec<f32>>,
 }
 
 /// Result of the `enqueue` tool.
 #[derive(Debug, Serialize, JsonSchema)]
 struct EnqueueResult {
-    /// The enqueued message's id. A later `claim` returns this same id
-    /// when it delivers the message; pass it to `ack`/`nack` then.
+    /// The id of the message this call resolved to — either genuinely
+    /// new, or (if `deduplicated` is true) the existing near-duplicate
+    /// task it collapsed into. Either way, a later `claim` returns this
+    /// same id when it delivers the message; pass it to `ack`/`nack`
+    /// then.
     message_id: String,
+    /// Which queue this task actually landed in — always worth checking
+    /// when `queue` was omitted from the request and the server picked
+    /// one via routing instead.
+    queue: String,
+    /// `true` if `embedding` matched an existing task closely enough
+    /// (see the module docs on `DEDUP_SIMILARITY_THRESHOLD`) that this
+    /// call was collapsed into it rather than creating a new message —
+    /// `message_id` is that existing task's id, and no new message was
+    /// written.
+    deduplicated: bool,
+    /// The cosine similarity score that triggered dedup, if
+    /// `deduplicated` is true (`null` otherwise).
+    similarity: Option<f32>,
     /// Tokens left in the queue's budget for the rest of this window
     /// after admitting this enqueue, if a token budget is configured for
-    /// it (`null` otherwise).
+    /// it (`null` otherwise). `null` when `deduplicated` is true, too —
+    /// a collapsed enqueue was never checked against admission at all.
     tokens_remaining: Option<u64>,
     /// Dollars left in the queue's cost ceiling for the rest of this
     /// window after admitting this enqueue, if a cost ceiling is
-    /// configured for it (`null` otherwise).
+    /// configured for it (`null` otherwise). Same `deduplicated`
+    /// exception as `tokens_remaining`.
     cost_remaining: Option<f64>,
 }
 
@@ -486,6 +603,31 @@ struct AdmissionStatusResult {
     cost_remaining: Option<f64>,
 }
 
+/// Arguments for the `configure_route` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureRouteParams {
+    /// Which queue this route points at. Opened automatically if it
+    /// doesn't exist yet, same as every other tool here — registering a
+    /// route doesn't require the queue to have ever been enqueued to.
+    queue: String,
+    /// This queue's descriptor embedding: a caller-computed vector
+    /// representing the *kind* of task this queue's consumers specialize
+    /// in (e.g. an embedding of "code review tasks" for a code-review
+    /// queue). An `enqueue` call that omits `queue` is routed to
+    /// whichever registered queue's descriptor is closest to its own
+    /// embedding.
+    embedding: Vec<f32>,
+}
+
+/// Result of the `configure_route` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ConfigureRouteResult {
+    /// Every queue name currently registered as a route, including this
+    /// call's — useful for seeing the full picture without a separate
+    /// listing tool.
+    registered_routes: Vec<String>,
+}
+
 /// The MCP server itself. Cheap to clone — the only state is an `Arc`'d
 /// [`QueueRegistry`] — which `rmcp` relies on internally when handling
 /// more than one tool call concurrently over the same connection.
@@ -514,16 +656,48 @@ impl QaasMcpServer {
         &self,
         Parameters(params): Parameters<EnqueueParams>,
     ) -> Result<Json<EnqueueResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
-        let admission = self.registry.admission(&params.queue).await?;
+        let embedding = params.embedding.map(Embedding::new).transpose().map_err(|_| {
+            ErrorData::invalid_params(
+                "embedding must be non-empty and contain only finite values",
+                None,
+            )
+        })?;
 
-        // Validated before admission is consulted: a malformed request
-        // shouldn't spend any of the queue's budget on its way to being
-        // rejected anyway.
+        let queue_name = self.resolve_target_queue(params.queue, embedding.as_ref()).await?;
+        let group = self.registry.get(&queue_name).await?;
+        let admission = self.registry.admission(&queue_name).await?;
+        let dedup = match &embedding {
+            Some(_) => Some(self.registry.dedup(&queue_name).await?),
+            None => None,
+        };
+
+        // Validated before admission (or dedup) is consulted: a
+        // malformed request shouldn't spend any of the queue's budget,
+        // or get compared against other tasks' embeddings, on its way
+        // to being rejected anyway.
         let idempotency_key =
             params.idempotency_key.map(qaas_types::IdempotencyKey::new).transpose().map_err(
                 |_| ErrorData::invalid_params("idempotency_key must not be empty", None),
             )?;
+
+        // Dedup runs before admission, not after: a collapsed enqueue
+        // creates no new work, so it shouldn't cost any of the queue's
+        // token/cost budget either — see EnqueueResult::tokens_remaining's
+        // own docs on why that field is `null` when `deduplicated` is
+        // `true`.
+        if let (Some(dedup), Some(embedding)) = (&dedup, &embedding)
+            && let Some((existing_id, similarity)) = dedup.nearest(embedding).await
+            && similarity >= DEDUP_SIMILARITY_THRESHOLD
+        {
+            return Ok(Json(EnqueueResult {
+                message_id: existing_id.to_string(),
+                queue: queue_name,
+                deduplicated: true,
+                similarity: Some(similarity),
+                tokens_remaining: None,
+                cost_remaining: None,
+            }));
+        }
 
         let (tokens_remaining, cost_remaining) = match admission
             .try_admit(params.estimated_tokens.unwrap_or(0), params.estimated_cost.unwrap_or(0.0))
@@ -543,11 +717,52 @@ impl QaasMcpServer {
         }
         .map_err(|error| io_error_to_mcp(&error))?;
 
+        if let (Some(dedup), Some(embedding)) = (dedup, embedding) {
+            dedup.insert(message_id, embedding).await;
+        }
+
         Ok(Json(EnqueueResult {
             message_id: message_id.to_string(),
+            queue: queue_name,
+            deduplicated: false,
+            similarity: None,
             tokens_remaining,
             cost_remaining,
         }))
+    }
+
+    /// Resolves `enqueue`'s target queue name: `explicit_queue` directly
+    /// if given, otherwise the nearest registered route to `embedding`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::INVALID_PARAMS`](rmcp::model::ErrorCode) if
+    /// both `explicit_queue` and `embedding` are absent (nothing to
+    /// route on), or if `embedding` is given but no route has ever been
+    /// registered via `configure_route` to match it against.
+    async fn resolve_target_queue(
+        &self,
+        explicit_queue: Option<String>,
+        embedding: Option<&Embedding>,
+    ) -> Result<String, ErrorData> {
+        if let Some(queue) = explicit_queue {
+            return Ok(queue);
+        }
+        let Some(embedding) = embedding else {
+            return Err(ErrorData::invalid_params(
+                "queue is required unless embedding is given, for routing",
+                None,
+            ));
+        };
+        self.registry.routes.nearest(embedding).await.map(|(queue, _similarity)| queue).ok_or_else(
+            || {
+                ErrorData::invalid_params(
+                    "queue was omitted and no routes are registered - call configure_route \
+                     first, or specify queue directly",
+                    None,
+                )
+            },
+        )
     }
 
     /// Claims the next available message from a named queue, waiting up
@@ -620,6 +835,18 @@ impl QaasMcpServer {
         let token = LeaseToken::from_u64(params.lease_token);
 
         let acked = group.ack(message_id, token).await.map_err(|error| io_error_to_mcp(&error))?;
+
+        if acked {
+            // Precise cleanup for the common case — a message acked
+            // quickly shouldn't keep blocking dedup for the rest of
+            // DEDUP_TTL just because nothing told the index it's gone.
+            // Not load-bearing for correctness (the TTL is what actually
+            // bounds the gap for every other way a message leaves the
+            // live queue — nack, dead-lettering, a crashed consumer —
+            // that this server can't observe directly), just tighter
+            // than waiting on it here.
+            self.registry.dedup(&params.queue).await?.remove(&message_id).await;
+        }
         Ok(Json(AckResult { acked }))
     }
 
@@ -718,6 +945,32 @@ impl QaasMcpServer {
                 .map(|ceiling| (ceiling - usage.cost_used).max(0.0)),
         }))
     }
+
+    /// Registers (or replaces) a queue's routing descriptor embedding.
+    #[tool(
+        description = "Register (or replace) a queue's routing descriptor embedding - a vector \
+                        representing the kind of task that queue's consumers specialize in. An \
+                        enqueue call that omits queue is routed to whichever registered queue's \
+                        descriptor is closest to its own embedding."
+    )]
+    async fn configure_route(
+        &self,
+        Parameters(params): Parameters<ConfigureRouteParams>,
+    ) -> Result<Json<ConfigureRouteResult>, ErrorData> {
+        validate_queue_name(&params.queue)?;
+        let embedding = Embedding::new(params.embedding).map_err(|_| {
+            ErrorData::invalid_params(
+                "embedding must be non-empty and contain only finite values",
+                None,
+            )
+        })?;
+
+        self.registry.routes.insert(params.queue, embedding).await;
+        let mut registered_routes = self.registry.routes.keys().await;
+        registered_routes.sort_unstable();
+
+        Ok(Json(ConfigureRouteResult { registered_routes }))
+    }
 }
 
 #[tool_handler(
@@ -733,7 +986,10 @@ impl QaasMcpServer {
                     window, off by default) and admission_status to check current usage; enqueue \
                     can decline a task that would exceed the budget (pass estimated_tokens / \
                     estimated_cost to be checked), and claim reports throttled: true instead of \
-                    waiting when the queue is currently over budget."
+                    waiting when the queue is currently over budget. Pass embedding (a vector from \
+                    your own embedding model) to enqueue to collapse near-duplicate tasks into an \
+                    existing one automatically, or omit queue entirely to have the task routed to \
+                    the closest match among queues registered via configure_route."
 )]
 impl ServerHandler for QaasMcpServer {}
 
@@ -746,6 +1002,21 @@ mod tests {
 
     fn server(dir: &tempfile::TempDir) -> QaasMcpServer {
         QaasMcpServer::new(dir.path())
+    }
+
+    /// Every `EnqueueParams` field except `queue`/`payload`, defaulted to
+    /// "not participating in this feature" — most tests only care about
+    /// one or two fields and would otherwise have to spell out every
+    /// admission/dedup/routing field just to get a bare enqueue.
+    fn enqueue_params(queue: &str, payload: serde_json::Value) -> super::EnqueueParams {
+        super::EnqueueParams {
+            queue: Some(queue.to_string()),
+            payload,
+            idempotency_key: None,
+            estimated_tokens: None,
+            estimated_cost: None,
+            embedding: None,
+        }
     }
 
     #[test]
@@ -764,16 +1035,15 @@ mod tests {
         let server = server(&dir);
 
         let enqueued = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!({"item": "widget"}),
-                idempotency_key: None,
-                estimated_tokens: None,
-                estimated_cost: None,
-            }))
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "orders",
+                json!({"item": "widget"}),
+            )))
             .await
             .unwrap()
             .0;
+        assert_eq!(enqueued.queue, "orders");
+        assert!(!enqueued.deduplicated);
 
         let claimed = server
             .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
@@ -807,13 +1077,10 @@ mod tests {
         let server = server(&dir);
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "workflows".to_string(),
-                payload: json!("start the task"),
-                idempotency_key: None,
-                estimated_tokens: None,
-                estimated_cost: None,
-            }))
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "workflows",
+                json!("start the task"),
+            )))
             .await
             .unwrap();
 
@@ -935,11 +1202,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let server = server(&dir);
         let params = || super::EnqueueParams {
-            queue: "orders".to_string(),
-            payload: json!("payload"),
             idempotency_key: Some("dedup-1".to_string()),
-            estimated_tokens: None,
-            estimated_cost: None,
+            ..enqueue_params("orders", json!("payload"))
         };
 
         let first =
@@ -956,13 +1220,10 @@ mod tests {
         let server = server(&dir);
 
         let result = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "../escape".to_string(),
-                payload: json!("x"),
-                idempotency_key: None,
-                estimated_tokens: None,
-                estimated_cost: None,
-            }))
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "../escape",
+                json!("x"),
+            )))
             .await;
 
         // `Json<EnqueueResult>` isn't `Debug` (it's `rmcp`'s wrapper
@@ -981,11 +1242,9 @@ mod tests {
 
         let enqueued = server
             .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!("x"),
-                idempotency_key: None,
                 estimated_tokens: Some(1_000_000_000),
                 estimated_cost: Some(1_000_000.0),
+                ..enqueue_params("orders", json!("x"))
             }))
             .await
             .unwrap()
@@ -1013,11 +1272,8 @@ mod tests {
 
         let first = server
             .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!("first"),
-                idempotency_key: None,
                 estimated_tokens: Some(80),
-                estimated_cost: None,
+                ..enqueue_params("orders", json!("first"))
             }))
             .await
             .unwrap()
@@ -1026,11 +1282,8 @@ mod tests {
 
         let result = server
             .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!("second"),
-                idempotency_key: None,
                 estimated_tokens: Some(50),
-                estimated_cost: None,
+                ..enqueue_params("orders", json!("second"))
             }))
             .await;
 
@@ -1047,13 +1300,10 @@ mod tests {
         let server = server(&dir);
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!("a real message, sitting right there"),
-                idempotency_key: None,
-                estimated_tokens: None,
-                estimated_cost: None,
-            }))
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "orders",
+                json!("a real message, sitting right there"),
+            )))
             .await
             .unwrap();
 
@@ -1103,11 +1353,9 @@ mod tests {
 
         server
             .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: "orders".to_string(),
-                payload: json!("x"),
-                idempotency_key: None,
                 estimated_tokens: Some(200),
                 estimated_cost: Some(1.5),
+                ..enqueue_params("orders", json!("x"))
             }))
             .await
             .unwrap();
@@ -1127,5 +1375,195 @@ mod tests {
         assert!((status.cost_used - 1.5).abs() < f64::EPSILON, "{}", status.cost_used);
         assert_eq!(status.tokens_remaining, Some(800));
         assert_eq!(status.cost_remaining, Some(3.5));
+    }
+
+    #[tokio::test]
+    async fn near_duplicate_enqueues_collapse_into_the_original() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let first = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![1.0, 0.0, 0.0]),
+                ..enqueue_params("support", json!("please reset my password"))
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!first.deduplicated);
+
+        // Slightly different wording, near-identical meaning (a tiny
+        // nudge off the same direction) — this is the whole scenario
+        // Plan.md's line names: another agent independently queuing the
+        // same underlying task.
+        let second = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![0.999, 0.001, 0.0]),
+                ..enqueue_params("support", json!("can you reset my password please"))
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(second.deduplicated);
+        assert_eq!(second.message_id, first.message_id);
+        assert!(second.similarity.unwrap() >= super::DEDUP_SIMILARITY_THRESHOLD);
+        assert_eq!(second.tokens_remaining, None, "a collapsed enqueue shouldn't touch admission");
+
+        // Only one message actually made it into the queue.
+        let group = server.registry.get("support").await.unwrap();
+        assert_eq!(group.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn dissimilar_embeddings_do_not_collapse() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![1.0, 0.0]),
+                ..enqueue_params("support", json!("reset my password"))
+            }))
+            .await
+            .unwrap();
+
+        let second = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![0.0, 1.0]),
+                ..enqueue_params("support", json!("cancel my subscription"))
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!second.deduplicated);
+        let group = server.registry.get("support").await.unwrap();
+        assert_eq!(group.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn acking_a_message_frees_its_embedding_for_reuse_immediately() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let first = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![1.0, 0.0]),
+                ..enqueue_params("support", json!("reset my password"))
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "support".to_string(),
+                wait_ms: Some(100),
+            }))
+            .await
+            .unwrap()
+            .0;
+        server
+            .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
+                queue: "support".to_string(),
+                message_id: claimed.message_id.unwrap(),
+                lease_token: claimed.lease_token.unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        // The first task is done and gone — a near-identical *new* task
+        // must not be silently swallowed as a "duplicate" of it.
+        let second = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                embedding: Some(vec![1.0, 0.0]),
+                ..enqueue_params("support", json!("reset my password again"))
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!second.deduplicated);
+        assert_ne!(second.message_id, first.message_id);
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_a_queue_or_embedding_is_rejected() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: None,
+                ..enqueue_params("unused", json!("x"))
+            }))
+            .await;
+
+        let Err(error) = result else {
+            panic!("expected an error with neither queue nor embedding given");
+        };
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_a_queue_routes_to_the_closest_registered_descriptor() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let routes = server
+            .configure_route(rmcp::handler::server::wrapper::Parameters(
+                super::ConfigureRouteParams {
+                    queue: "billing".to_string(),
+                    embedding: vec![1.0, 0.0],
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(routes.registered_routes, vec!["billing".to_string()]);
+
+        server
+            .configure_route(rmcp::handler::server::wrapper::Parameters(
+                super::ConfigureRouteParams {
+                    queue: "support".to_string(),
+                    embedding: vec![0.0, 1.0],
+                },
+            ))
+            .await
+            .unwrap();
+
+        let enqueued = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: None,
+                embedding: Some(vec![0.9, 0.1]),
+                ..enqueue_params("unused", json!("a billing question"))
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(enqueued.queue, "billing");
+        let group = server.registry.get("billing").await.unwrap();
+        assert_eq!(group.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn routing_with_no_routes_registered_is_rejected() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
+                queue: None,
+                embedding: Some(vec![1.0, 0.0]),
+                ..enqueue_params("unused", json!("x"))
+            }))
+            .await;
+
+        let Err(error) = result else {
+            panic!("expected an error with no routes registered");
+        };
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }

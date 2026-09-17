@@ -88,6 +88,18 @@
 //! `circuit_breaker` isn't — a domain-agnostic queue engine has no
 //! business knowing what a token costs. `qaas-server`'s MCP layer is
 //! where it's actually consulted.
+//!
+//! [`semantic`] (`feature/semantic-dedup-routing`) has no rate-limiter
+//! ancestor — it's genuinely new here: [`semantic::Embedding`] validates
+//! a vector a *caller* computed (this crate has no embedding model of
+//! its own, and never will — see the module's own docs for why), and
+//! [`semantic::EmbeddingIndex`] finds the closest match to a query
+//! embedding by cosine similarity, generic over what's being searched.
+//! `qaas-server` uses one instance keyed by queue name for routing an
+//! untargeted `enqueue` to the best-matching queue, and one per queue
+//! keyed by `MessageId` for collapsing near-duplicate tasks before they
+//! ever reach `ConsumerGroup` — same domain-agnostic-core split as
+//! `circuit_breaker` and `admission` again.
 
 pub mod admission;
 pub mod circuit_breaker;
@@ -96,6 +108,7 @@ pub mod dead_letter;
 pub mod queue;
 pub mod raft;
 pub mod retry;
+pub mod semantic;
 pub mod wal;
 
 pub use admission::{AdmissionConfig, AdmissionController, AdmissionDecision, UsageSnapshot};
@@ -107,4 +120,5 @@ pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
 pub use dead_letter::{DeadLetter, DeadLetterQueue};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
 pub use retry::RetryPolicy;
+pub use semantic::{Embedding, EmbeddingIndex, InvalidEmbedding};
 pub use wal::Wal;
