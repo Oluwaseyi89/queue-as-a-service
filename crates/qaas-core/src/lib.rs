@@ -78,7 +78,18 @@
 //! resurrect as pending after a restart, because dead-lettering never
 //! recorded anything in `ConsumerGroup`'s own WAL — see
 //! `consumer_group::WalRecord::DeadLettered`'s docs.
+//!
+//! [`admission`] (`feature/token-cost-aware-admission`) is this crate's
+//! second port of a global-rate-limiter mechanism, after
+//! [`circuit_breaker`]: [`admission::AdmissionController`] is the same
+//! sliding-window algorithm as `SlidingWindowLimiter`'s actual Go source,
+//! denominated in LLM tokens and dollars instead of request counts.
+//! Deliberately not wired into `ConsumerGroup` for the same reason
+//! `circuit_breaker` isn't — a domain-agnostic queue engine has no
+//! business knowing what a token costs. `qaas-server`'s MCP layer is
+//! where it's actually consulted.
 
+pub mod admission;
 pub mod circuit_breaker;
 pub mod consumer_group;
 pub mod dead_letter;
@@ -87,6 +98,7 @@ pub mod raft;
 pub mod retry;
 pub mod wal;
 
+pub use admission::{AdmissionConfig, AdmissionController, AdmissionDecision, UsageSnapshot};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitState, FallbackCache,
     HybridGuard, HybridOutcome,
