@@ -215,12 +215,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use qaas_core::{
-    AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, Embedding,
-    EmbeddingIndex, LeaseToken, PartialResultsPoll, RetryPolicy, TriageClassification,
+    AdmissionConfig, AdmissionController, AdmissionDecision, ApiKeyStore, ConsumerGroup, Embedding,
+    EmbeddingIndex, LeaseToken, PartialResultsPoll, RetryPolicy, TenantId, TriageClassification,
     TriageVerdict,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -306,6 +307,26 @@ fn io_error_to_mcp(error: &std::io::Error) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
 
+/// The authenticated tenant for this tool call, if any — `None` for a
+/// call that arrived over the trusted local stdio connection (no
+/// authentication happens there at all; see this module's own docs), or
+/// `Some` for one that arrived over HTTP, where `crate::http_auth`'s
+/// middleware has *already* verified a bearer credential and inserted
+/// the [`TenantId`] it resolved to into the request's own extensions
+/// before this call was ever dispatched — this function only reads that
+/// back, it never itself decides whether a caller is who it claims.
+///
+/// Reads through two layers, both documented (and demonstrated) in
+/// `rmcp`'s own `StreamableHttpService` docs: `ctx.extensions` carries
+/// the raw `http::request::Parts` for an HTTP-transport call (absent
+/// entirely for stdio, which is exactly what makes the `None` case work
+/// without any transport-specific branching here); `Parts.extensions`
+/// is where a tower/axum `Extension` layer — `http_auth`'s middleware —
+/// puts application state onto the request itself.
+fn tenant_from(ctx: &RequestContext<RoleServer>) -> Option<TenantId> {
+    ctx.extensions.get::<http::request::Parts>()?.extensions.get::<TenantId>().cloned()
+}
+
 /// Maps an [`AdmissionDecision::Denied`] onto the MCP error shape.
 /// [`ErrorCode::INVALID_REQUEST`](rmcp::model::ErrorCode) rather than
 /// `INVALID_PARAMS`: the request itself is well-formed, just not
@@ -323,9 +344,23 @@ fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> Error
 }
 
 /// Lazily opens and holds one [`ConsumerGroup`], one
-/// [`AdmissionController`], and one dedup [`EmbeddingIndex`] per queue
-/// name, plus a single registry-wide [`EmbeddingIndex`] of every queue's
-/// routing descriptor.
+/// [`AdmissionController`], and one dedup [`EmbeddingIndex`] per
+/// *tenant-scoped* queue name, plus one routing [`EmbeddingIndex`] per
+/// tenant.
+///
+/// Every lookup here takes `tenant: Option<&TenantId>` — `None` for a
+/// call that came in over the trusted local stdio connection (see this
+/// module's own docs on why that connection stays unauthenticated),
+/// `Some` for one that arrived over HTTP and was authenticated to a
+/// specific tenant by [`crate::http_auth`]'s middleware before ever
+/// reaching a tool method. `Some(a)` and `Some(b)` (or `None`) never see
+/// or touch each other's queues, even if they both ask for a queue
+/// literally named `"orders"` — this is the actual trust boundary
+/// `feature/api-auth` exists to build, not just bookkeeping: isolation
+/// is total and unconditional, not a permission a tenant could be
+/// granted or denied. What a tenant *can't* yet do anything about is how
+/// much of a shared budget it uses — that's `feature/multi-tenant-quotas`,
+/// a deliberately separate, later branch.
 ///
 /// A `ConsumerGroup` owns a WAL file and does its own internal locking
 /// once opened, so this registry's own lock is only ever held for the
@@ -343,7 +378,7 @@ struct QueueRegistry {
     groups: Mutex<HashMap<String, Arc<ConsumerGroup<serde_json::Value>>>>,
     admission: Mutex<HashMap<String, Arc<AdmissionController>>>,
     dedup: Mutex<HashMap<String, Arc<EmbeddingIndex<qaas_types::MessageId>>>>,
-    routes: EmbeddingIndex<String>,
+    routes: Mutex<HashMap<String, Arc<EmbeddingIndex<String>>>>,
 }
 
 impl QueueRegistry {
@@ -353,65 +388,130 @@ impl QueueRegistry {
             groups: Mutex::new(HashMap::new()),
             admission: Mutex::new(HashMap::new()),
             dedup: Mutex::new(HashMap::new()),
-            routes: EmbeddingIndex::new(None),
+            routes: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns the queue named `name`, opening it (creating its WAL file
-    /// under `data_dir` if this is the first reference to it, in this
-    /// process or ever) if it isn't already held.
-    async fn get(&self, name: &str) -> Result<Arc<ConsumerGroup<serde_json::Value>>, ErrorData> {
+    /// The key every per-queue map here is actually keyed by: `name`
+    /// alone for `tenant: None`, or `name` prefixed with the tenant id
+    /// otherwise. `\0` (a null byte) as the separator, not `/` or `:` —
+    /// both `TenantId` and a validated queue name are restricted to
+    /// `[A-Za-z0-9_-]`, so a null byte can never appear in either half
+    /// and can never be ambiguous between "tenant `a`, queue `b/c`" and
+    /// "tenant `a/b`, queue `c`" the way a printable separator might
+    /// invite someone to assume.
+    fn scope_key(tenant: Option<&TenantId>, name: &str) -> String {
+        match tenant {
+            Some(tenant) => format!("{}\0{name}", tenant.as_str()),
+            None => name.to_string(),
+        }
+    }
+
+    /// Same idea as [`scope_key`](Self::scope_key), but for `routes`,
+    /// which isn't keyed by queue name at all (a route registry spans
+    /// every queue name within one tenant) — just by tenant.
+    fn tenant_key(tenant: Option<&TenantId>) -> String {
+        tenant.map_or_else(String::new, |tenant| tenant.as_str().to_string())
+    }
+
+    /// Returns `tenant`'s queue named `name`, opening it (creating its
+    /// WAL file under `data_dir` — under a `tenant`-named subdirectory
+    /// when `tenant` is `Some`, so two tenants' `"orders"` queues are
+    /// physically different files on disk, not just different map
+    /// entries — if this is the first reference to it, in this process
+    /// or ever) if it isn't already held.
+    async fn get(
+        &self,
+        tenant: Option<&TenantId>,
+        name: &str,
+    ) -> Result<Arc<ConsumerGroup<serde_json::Value>>, ErrorData> {
         validate_queue_name(name)?;
+        let key = Self::scope_key(tenant, name);
 
         let mut groups = self.groups.lock().await;
-        if let Some(group) = groups.get(name) {
+        if let Some(group) = groups.get(&key) {
             return Ok(Arc::clone(group));
         }
 
-        let path = self.data_dir.join(format!("{name}.wal"));
+        let dir = match tenant {
+            Some(tenant) => self.data_dir.join(tenant.as_str()),
+            None => self.data_dir.clone(),
+        };
+        // `main.rs` only ever creates `data_dir` itself - a per-tenant
+        // subdirectory is this registry's own responsibility, created
+        // lazily the same way the `ConsumerGroup` it's about to hold is:
+        // the first tool call for a given tenant is also the first time
+        // anything needs this directory to exist at all.
+        tokio::fs::create_dir_all(&dir).await.map_err(|error| {
+            ErrorData::internal_error(format!("failed to open queue {name:?}: {error}"), None)
+        })?;
+        let path = dir.join(format!("{name}.wal"));
         let group = ConsumerGroup::open(path, VISIBILITY_TIMEOUT, RetryPolicy::DEFAULT)
             .await
             .map_err(|error| {
                 ErrorData::internal_error(format!("failed to open queue {name:?}: {error}"), None)
             })?;
         let group = Arc::new(group);
-        groups.insert(name.to_string(), Arc::clone(&group));
+        groups.insert(key, Arc::clone(&group));
         Ok(group)
     }
 
-    /// Returns the admission controller for `name`, creating one with
-    /// [`AdmissionConfig::UNLIMITED`] on first reference — a queue no one
-    /// has ever called `configure_admission` on is never throttled, not
-    /// throttled by some undocumented default.
-    async fn admission(&self, name: &str) -> Result<Arc<AdmissionController>, ErrorData> {
+    /// Returns `tenant`'s admission controller for `name`, creating one
+    /// with [`AdmissionConfig::UNLIMITED`] on first reference — a queue
+    /// no one has ever called `configure_admission` on is never
+    /// throttled, not throttled by some undocumented default.
+    async fn admission(
+        &self,
+        tenant: Option<&TenantId>,
+        name: &str,
+    ) -> Result<Arc<AdmissionController>, ErrorData> {
         validate_queue_name(name)?;
+        let key = Self::scope_key(tenant, name);
 
         let mut controllers = self.admission.lock().await;
-        if let Some(controller) = controllers.get(name) {
+        if let Some(controller) = controllers.get(&key) {
             return Ok(Arc::clone(controller));
         }
 
         let controller = Arc::new(AdmissionController::new(AdmissionConfig::UNLIMITED));
-        controllers.insert(name.to_string(), Arc::clone(&controller));
+        controllers.insert(key, Arc::clone(&controller));
         Ok(controller)
     }
 
-    /// Returns `name`'s dedup index, creating an empty, [`DEDUP_TTL`]'d
-    /// one on first reference.
+    /// Returns `tenant`'s dedup index for `name`, creating an empty,
+    /// [`DEDUP_TTL`]'d one on first reference.
     async fn dedup(
         &self,
+        tenant: Option<&TenantId>,
         name: &str,
     ) -> Result<Arc<EmbeddingIndex<qaas_types::MessageId>>, ErrorData> {
         validate_queue_name(name)?;
+        let key = Self::scope_key(tenant, name);
 
         let mut indexes = self.dedup.lock().await;
-        if let Some(index) = indexes.get(name) {
+        if let Some(index) = indexes.get(&key) {
             return Ok(Arc::clone(index));
         }
 
         let index = Arc::new(EmbeddingIndex::new(Some(DEDUP_TTL)));
-        indexes.insert(name.to_string(), Arc::clone(&index));
+        indexes.insert(key, Arc::clone(&index));
         Ok(index)
+    }
+
+    /// Returns `tenant`'s route registry, creating an empty one on first
+    /// reference. Never validated against `validate_queue_name` — this
+    /// isn't keyed by a single queue name at all.
+    async fn routes(&self, tenant: Option<&TenantId>) -> Arc<EmbeddingIndex<String>> {
+        let key = Self::tenant_key(tenant);
+
+        let mut registries = self.routes.lock().await;
+        if let Some(routes) = registries.get(&key) {
+            return Arc::clone(routes);
+        }
+
+        let routes = Arc::new(EmbeddingIndex::new(None));
+        registries.insert(key, Arc::clone(&routes));
+        routes
     }
 }
 
@@ -900,23 +1000,78 @@ struct PurgeDeadLetterResult {
     purged: bool,
 }
 
-/// The MCP server itself. Cheap to clone — the only state is an `Arc`'d
-/// [`QueueRegistry`] — which `rmcp` relies on internally when handling
-/// more than one tool call concurrently over the same connection.
+/// Arguments for the `create_api_key` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateApiKeyParams {
+    /// The tenant this key authenticates as once used over HTTP. Created
+    /// on first use — there's no separate "register a tenant" step,
+    /// matching how a queue name needs no separate provisioning either.
+    tenant_id: String,
+}
+
+/// Result of the `create_api_key` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct CreateApiKeyResult {
+    /// The raw credential — shown exactly once, here. QaaS only ever
+    /// stores its SHA-256 hash (see `qaas_core::auth`'s own docs), so
+    /// there is no way to recover it later if this response is lost;
+    /// minting a replacement is the only remedy.
+    api_key: String,
+    /// The tenant this key authenticates as, echoed back for
+    /// confirmation.
+    tenant_id: String,
+}
+
+/// Arguments for the `revoke_api_key` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RevokeApiKeyParams {
+    /// The raw API key to revoke, exactly as returned by
+    /// `create_api_key`.
+    api_key: String,
+}
+
+/// Result of the `revoke_api_key` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct RevokeApiKeyResult {
+    /// `false` means this key was already revoked, or never existed —
+    /// same "already gone" stance every other resolve-once operation in
+    /// this module takes.
+    revoked: bool,
+}
+
+/// The MCP server itself. Cheap to clone — the only state is two
+/// `Arc`'d pieces, [`QueueRegistry`] and [`ApiKeyStore`] — which `rmcp`
+/// relies on internally when handling more than one tool call
+/// concurrently over the same connection, and which `crate::http_auth`'s
+/// middleware also needs a handle to, independently of any particular
+/// connection.
 #[derive(Clone)]
 pub struct QaasMcpServer {
     registry: Arc<QueueRegistry>,
+    /// Public so `crate::http_auth`'s middleware — which runs *before*
+    /// any tool method, as part of routing an HTTP request to this
+    /// server at all — can authenticate a bearer credential against it
+    /// directly, without going through a tool call to do so.
+    pub api_keys: Arc<ApiKeyStore>,
 }
 
 #[tool_router]
 impl QaasMcpServer {
-    /// Creates a server that opens queue WAL files under `data_dir`
-    /// (creating the directory itself is the caller's job — see
-    /// `main.rs`), ready to be handed to
-    /// [`ServiceExt::serve`](rmcp::ServiceExt::serve).
-    #[must_use]
-    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
-        Self { registry: Arc::new(QueueRegistry::new(data_dir.into())) }
+    /// Opens (creating if necessary) queue WAL files under `data_dir`
+    /// and the API-key store at `data_dir/api_keys.log`, returning a
+    /// server ready to be handed to
+    /// [`ServiceExt::serve`](rmcp::ServiceExt::serve) — for stdio, and,
+    /// wrapped in `crate::http_auth`'s middleware first, for the
+    /// streamable-HTTP transport `main.rs` also stands up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if opening the API-key store's WAL fails — see
+    /// [`ApiKeyStore::open`](qaas_core::ApiKeyStore::open).
+    pub async fn new(data_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let data_dir = data_dir.into();
+        let api_keys = ApiKeyStore::open(data_dir.join("api_keys.log")).await?;
+        Ok(Self { registry: Arc::new(QueueRegistry::new(data_dir)), api_keys: Arc::new(api_keys) })
     }
 
     /// Durably enqueues a message onto a named queue, creating the queue
@@ -927,6 +1082,21 @@ impl QaasMcpServer {
     async fn enqueue(
         &self,
         Parameters(params): Parameters<EnqueueParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<EnqueueResult>, ErrorData> {
+        self.enqueue_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `enqueue` logic, taking `tenant` directly rather than a
+    /// [`RequestContext`] — split out so tests can call it (including
+    /// with an explicit `Some(tenant)`, to exercise isolation) without
+    /// needing a real MCP connection to construct a context from, since
+    /// `rmcp` gives no public way to build one outside of actually
+    /// serving a client.
+    async fn enqueue_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: EnqueueParams,
     ) -> Result<Json<EnqueueResult>, ErrorData> {
         let embedding = params.embedding.map(Embedding::new).transpose().map_err(|_| {
             ErrorData::invalid_params(
@@ -935,11 +1105,12 @@ impl QaasMcpServer {
             )
         })?;
 
-        let queue_name = self.resolve_target_queue(params.queue, embedding.as_ref()).await?;
-        let group = self.registry.get(&queue_name).await?;
-        let admission = self.registry.admission(&queue_name).await?;
+        let queue_name =
+            self.resolve_target_queue(tenant.as_ref(), params.queue, embedding.as_ref()).await?;
+        let group = self.registry.get(tenant.as_ref(), &queue_name).await?;
+        let admission = self.registry.admission(tenant.as_ref(), &queue_name).await?;
         let dedup = match &embedding {
-            Some(_) => Some(self.registry.dedup(&queue_name).await?),
+            Some(_) => Some(self.registry.dedup(tenant.as_ref(), &queue_name).await?),
             None => None,
         };
 
@@ -1014,6 +1185,7 @@ impl QaasMcpServer {
     /// registered via `configure_route` to match it against.
     async fn resolve_target_queue(
         &self,
+        tenant: Option<&TenantId>,
         explicit_queue: Option<String>,
         embedding: Option<&Embedding>,
     ) -> Result<String, ErrorData> {
@@ -1026,15 +1198,19 @@ impl QaasMcpServer {
                 None,
             ));
         };
-        self.registry.routes.nearest(embedding).await.map(|(queue, _similarity)| queue).ok_or_else(
-            || {
+        self.registry
+            .routes(tenant)
+            .await
+            .nearest(embedding)
+            .await
+            .map(|(queue, _similarity)| queue)
+            .ok_or_else(|| {
                 ErrorData::invalid_params(
                     "queue was omitted and no routes are registered - call configure_route \
                      first, or specify queue directly",
                     None,
                 )
-            },
-        )
+            })
     }
 
     /// Claims the next available message from a named queue, waiting up
@@ -1048,9 +1224,20 @@ impl QaasMcpServer {
     async fn claim(
         &self,
         Parameters(params): Parameters<ClaimParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ClaimResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
-        let admission = self.registry.admission(&params.queue).await?;
+        self.claim_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `claim` logic — see [`Self::enqueue_impl`]'s docs on
+    /// why this is split out from the `#[tool]`-annotated method.
+    async fn claim_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: ClaimParams,
+    ) -> Result<Json<ClaimResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
+        let admission = self.registry.admission(tenant.as_ref(), &params.queue).await?;
 
         // Checked before attempting to claim at all, and not waited out
         // the way an empty queue is — see the module docs for why this
@@ -1101,8 +1288,18 @@ impl QaasMcpServer {
     async fn ack(
         &self,
         Parameters(params): Parameters<AckParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<AckResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.ack_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `ack` logic — see [`Self::enqueue_impl`]'s docs.
+    async fn ack_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: AckParams,
+    ) -> Result<Json<AckResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let token = LeaseToken::from_u64(params.lease_token);
 
@@ -1117,7 +1314,7 @@ impl QaasMcpServer {
             // live queue — nack, dead-lettering, a crashed consumer —
             // that this server can't observe directly), just tighter
             // than waiting on it here.
-            self.registry.dedup(&params.queue).await?.remove(&message_id).await;
+            self.registry.dedup(tenant.as_ref(), &params.queue).await?.remove(&message_id).await;
         }
         Ok(Json(AckResult { acked }))
     }
@@ -1129,8 +1326,18 @@ impl QaasMcpServer {
     async fn nack(
         &self,
         Parameters(params): Parameters<NackParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<NackResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.nack_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `nack` logic — see [`Self::enqueue_impl`]'s docs.
+    async fn nack_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: NackParams,
+    ) -> Result<Json<NackResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let token = LeaseToken::from_u64(params.lease_token);
 
@@ -1153,8 +1360,18 @@ impl QaasMcpServer {
     async fn checkpoint(
         &self,
         Parameters(params): Parameters<CheckpointParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<CheckpointResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.checkpoint_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `checkpoint` logic — see [`Self::enqueue_impl`]'s docs.
+    async fn checkpoint_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: CheckpointParams,
+    ) -> Result<Json<CheckpointResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let token = LeaseToken::from_u64(params.lease_token);
 
@@ -1174,8 +1391,19 @@ impl QaasMcpServer {
     async fn publish_partial_result(
         &self,
         Parameters(params): Parameters<PublishPartialResultParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<PublishPartialResultResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.publish_partial_result_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `publish_partial_result` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn publish_partial_result_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: PublishPartialResultParams,
+    ) -> Result<Json<PublishPartialResultResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let token = LeaseToken::from_u64(params.lease_token);
 
@@ -1202,8 +1430,19 @@ impl QaasMcpServer {
     async fn stream_partial_results(
         &self,
         Parameters(params): Parameters<StreamPartialResultsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<StreamPartialResultsResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.stream_partial_results_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `stream_partial_results` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn stream_partial_results_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: StreamPartialResultsParams,
+    ) -> Result<Json<StreamPartialResultsResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let after = params.after_sequence.unwrap_or(0);
         let wait =
@@ -1246,8 +1485,19 @@ impl QaasMcpServer {
     async fn configure_admission(
         &self,
         Parameters(params): Parameters<ConfigureAdmissionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigureAdmissionResult>, ErrorData> {
-        let admission = self.registry.admission(&params.queue).await?;
+        self.configure_admission_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `configure_admission` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn configure_admission_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: ConfigureAdmissionParams,
+    ) -> Result<Json<ConfigureAdmissionResult>, ErrorData> {
+        let admission = self.registry.admission(tenant.as_ref(), &params.queue).await?;
         let window = Duration::from_secs(params.window_seconds.unwrap_or(3600));
         let config = AdmissionConfig {
             tokens_per_window: params.tokens_per_window,
@@ -1270,8 +1520,19 @@ impl QaasMcpServer {
     async fn admission_status(
         &self,
         Parameters(params): Parameters<AdmissionStatusParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<AdmissionStatusResult>, ErrorData> {
-        let admission = self.registry.admission(&params.queue).await?;
+        self.admission_status_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `admission_status` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn admission_status_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: AdmissionStatusParams,
+    ) -> Result<Json<AdmissionStatusResult>, ErrorData> {
+        let admission = self.registry.admission(tenant.as_ref(), &params.queue).await?;
         let config = admission.config().await;
         let usage = admission.usage().await;
 
@@ -1300,6 +1561,17 @@ impl QaasMcpServer {
     async fn configure_route(
         &self,
         Parameters(params): Parameters<ConfigureRouteParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<ConfigureRouteResult>, ErrorData> {
+        self.configure_route_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `configure_route` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn configure_route_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: ConfigureRouteParams,
     ) -> Result<Json<ConfigureRouteResult>, ErrorData> {
         validate_queue_name(&params.queue)?;
         let embedding = Embedding::new(params.embedding).map_err(|_| {
@@ -1309,8 +1581,9 @@ impl QaasMcpServer {
             )
         })?;
 
-        self.registry.routes.insert(params.queue, embedding).await;
-        let mut registered_routes = self.registry.routes.keys().await;
+        let routes = self.registry.routes(tenant.as_ref()).await;
+        routes.insert(params.queue, embedding).await;
+        let mut registered_routes = routes.keys().await;
         registered_routes.sort_unstable();
 
         Ok(Json(ConfigureRouteResult { registered_routes }))
@@ -1323,8 +1596,19 @@ impl QaasMcpServer {
     async fn list_dead_letters(
         &self,
         Parameters(params): Parameters<ListDeadLettersParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<Vec<DeadLetterSummary>>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.list_dead_letters_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `list_dead_letters` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn list_dead_letters_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: ListDeadLettersParams,
+    ) -> Result<Json<Vec<DeadLetterSummary>>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let dead_letters = group.dead_letters().await;
 
         Ok(Json(
@@ -1361,8 +1645,19 @@ impl QaasMcpServer {
     async fn triage_dead_letter(
         &self,
         Parameters(params): Parameters<TriageDeadLetterParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<TriageDeadLetterResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.triage_dead_letter_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `triage_dead_letter` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn triage_dead_letter_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: TriageDeadLetterParams,
+    ) -> Result<Json<TriageDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let classification: TriageClassification = params.classification.into();
         let verdict = TriageVerdict {
@@ -1399,8 +1694,19 @@ impl QaasMcpServer {
     async fn reprocess_dead_letter(
         &self,
         Parameters(params): Parameters<DeadLetterActionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ReprocessDeadLetterResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.reprocess_dead_letter_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `reprocess_dead_letter` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn reprocess_dead_letter_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: DeadLetterActionParams,
+    ) -> Result<Json<ReprocessDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let reprocessed = group
             .reprocess_dead_letter(message_id)
@@ -1417,12 +1723,100 @@ impl QaasMcpServer {
     async fn purge_dead_letter(
         &self,
         Parameters(params): Parameters<DeadLetterActionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<Json<PurgeDeadLetterResult>, ErrorData> {
-        let group = self.registry.get(&params.queue).await?;
+        self.purge_dead_letter_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `purge_dead_letter` logic — see
+    /// [`Self::enqueue_impl`]'s docs.
+    async fn purge_dead_letter_impl(
+        &self,
+        tenant: Option<TenantId>,
+        params: DeadLetterActionParams,
+    ) -> Result<Json<PurgeDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let purged =
             group.purge_dead_letter(message_id).await.map_err(|error| io_error_to_mcp(&error))?;
         Ok(Json(PurgeDeadLetterResult { purged }))
+    }
+
+    /// Mints a new API key for a tenant. Restricted to the trusted local
+    /// stdio connection — see the module docs on why key management
+    /// itself isn't reachable over the boundary it exists to defend.
+    #[tool(
+        description = "Mint a new API key for a tenant, for authenticating future HTTP calls to \
+                        this server as that tenant. The raw key is returned exactly once here - \
+                        only its hash is ever stored, so losing this response means minting a \
+                        replacement. Only available over the trusted local stdio connection."
+    )]
+    async fn create_api_key(
+        &self,
+        Parameters(params): Parameters<CreateApiKeyParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<CreateApiKeyResult>, ErrorData> {
+        self.create_api_key_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `create_api_key` logic — see [`Self::enqueue_impl`]'s
+    /// docs on why this is split out. `caller_tenant` is the tenant an
+    /// HTTP caller already authenticated as, if any — `None` means this
+    /// call arrived over stdio, the only place this tool is allowed to
+    /// be reached from.
+    async fn create_api_key_impl(
+        &self,
+        caller_tenant: Option<TenantId>,
+        params: CreateApiKeyParams,
+    ) -> Result<Json<CreateApiKeyResult>, ErrorData> {
+        // An HTTP-originated call always carries a resolved TenantId (the
+        // auth middleware guarantees that before dispatch ever happens),
+        // so `Some` here unambiguously means "not stdio" - an
+        // already-authenticated tenant credential has no business minting
+        // more credentials, for itself or anyone else. Least privilege,
+        // not a defense against a compromised middleware.
+        if caller_tenant.is_some() {
+            return Err(ErrorData::invalid_request(
+                "create_api_key is only available over the trusted local stdio connection",
+                None,
+            ));
+        }
+        let tenant = TenantId::new(params.tenant_id)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        let api_key =
+            self.api_keys.mint(tenant.clone()).await.map_err(|error| io_error_to_mcp(&error))?;
+        Ok(Json(CreateApiKeyResult { api_key, tenant_id: tenant.as_str().to_string() }))
+    }
+
+    /// Revokes an API key. Same stdio-only restriction as `create_api_key`.
+    #[tool(
+        description = "Revoke an API key so it can no longer authenticate any future call. Only \
+                        available over the trusted local stdio connection."
+    )]
+    async fn revoke_api_key(
+        &self,
+        Parameters(params): Parameters<RevokeApiKeyParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<RevokeApiKeyResult>, ErrorData> {
+        self.revoke_api_key_impl(tenant_from(&ctx), params).await
+    }
+
+    /// The actual `revoke_api_key` logic — see
+    /// [`Self::create_api_key_impl`]'s docs.
+    async fn revoke_api_key_impl(
+        &self,
+        caller_tenant: Option<TenantId>,
+        params: RevokeApiKeyParams,
+    ) -> Result<Json<RevokeApiKeyResult>, ErrorData> {
+        if caller_tenant.is_some() {
+            return Err(ErrorData::invalid_request(
+                "revoke_api_key is only available over the trusted local stdio connection",
+                None,
+            ));
+        }
+        let revoked =
+            self.api_keys.revoke(&params.api_key).await.map_err(|error| io_error_to_mcp(&error))?;
+        Ok(Json(RevokeApiKeyResult { revoked }))
     }
 }
 
@@ -1462,10 +1856,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{QaasMcpServer, validate_queue_name};
+    use super::{QaasMcpServer, TenantId, validate_queue_name};
 
-    fn server(dir: &tempfile::TempDir) -> QaasMcpServer {
-        QaasMcpServer::new(dir.path())
+    async fn server(dir: &tempfile::TempDir) -> QaasMcpServer {
+        QaasMcpServer::new(dir.path()).await.unwrap()
     }
 
     /// Dead-letters a message directly through `qaas-core`, bypassing
@@ -1534,13 +1928,10 @@ mod tests {
     #[tokio::test]
     async fn enqueue_then_claim_then_ack_round_trips_through_the_tool_methods() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let enqueued = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "orders",
-                json!({"item": "widget"}),
-            )))
+            .enqueue_impl(None, enqueue_params("orders", json!({"item": "widget"})))
             .await
             .unwrap()
             .0;
@@ -1548,10 +1939,10 @@ mod tests {
         assert!(!enqueued.deduplicated);
 
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "orders".to_string(),
-                wait_ms: Some(100),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(100) },
+            )
             .await
             .unwrap()
             .0;
@@ -1562,11 +1953,14 @@ mod tests {
         assert_eq!(claimed.checkpoint, None);
 
         let acked = server
-            .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
-                queue: "orders".to_string(),
-                message_id: claimed.message_id.unwrap(),
-                lease_token: claimed.lease_token.unwrap(),
-            }))
+            .ack_impl(
+                None,
+                super::AckParams {
+                    queue: "orders".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1576,33 +1970,33 @@ mod tests {
     #[tokio::test]
     async fn a_checkpoint_is_visible_on_the_next_claim_after_a_pausing_nack() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "workflows",
-                json!("start the task"),
-            )))
+            .enqueue_impl(None, enqueue_params("workflows", json!("start the task")))
             .await
             .unwrap();
 
         let first = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "workflows".to_string(),
-                wait_ms: Some(100),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "workflows".to_string(), wait_ms: Some(100) },
+            )
             .await
             .unwrap()
             .0;
 
         let progress = json!({"completed_steps": ["fetch", "summarize"]});
         let checkpointed = server
-            .checkpoint(rmcp::handler::server::wrapper::Parameters(super::CheckpointParams {
-                queue: "workflows".to_string(),
-                message_id: first.message_id.clone().unwrap(),
-                lease_token: first.lease_token.unwrap(),
-                state: progress.clone(),
-            }))
+            .checkpoint_impl(
+                None,
+                super::CheckpointParams {
+                    queue: "workflows".to_string(),
+                    message_id: first.message_id.clone().unwrap(),
+                    lease_token: first.lease_token.unwrap(),
+                    state: progress.clone(),
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1613,12 +2007,15 @@ mod tests {
         // checkpoint already saved should still be there for whoever
         // claims it next.
         let nacked = server
-            .nack(rmcp::handler::server::wrapper::Parameters(super::NackParams {
-                queue: "workflows".to_string(),
-                message_id: first.message_id.unwrap(),
-                lease_token: first.lease_token.unwrap(),
-                reason: None,
-            }))
+            .nack_impl(
+                None,
+                super::NackParams {
+                    queue: "workflows".to_string(),
+                    message_id: first.message_id.unwrap(),
+                    lease_token: first.lease_token.unwrap(),
+                    reason: None,
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1631,10 +2028,10 @@ mod tests {
         // this becomes exactly the kind of timing-sensitive test that's
         // flaky under load rather than one that's reliably correct.
         let resumed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "workflows".to_string(),
-                wait_ms: Some(2000),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "workflows".to_string(), wait_ms: Some(2000) },
+            )
             .await
             .unwrap()
             .0;
@@ -1645,15 +2042,18 @@ mod tests {
     #[tokio::test]
     async fn checkpointing_with_a_stale_lease_token_is_rejected() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .checkpoint(rmcp::handler::server::wrapper::Parameters(super::CheckpointParams {
-                queue: "workflows".to_string(),
-                message_id: qaas_types::MessageId::new().to_string(),
-                lease_token: 0,
-                state: json!("never claimed"),
-            }))
+            .checkpoint_impl(
+                None,
+                super::CheckpointParams {
+                    queue: "workflows".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    lease_token: 0,
+                    state: json!("never claimed"),
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1664,13 +2064,10 @@ mod tests {
     #[tokio::test]
     async fn claim_reports_unavailable_rather_than_blocking_forever_on_an_empty_queue() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "empty".to_string(),
-                wait_ms: Some(20),
-            }))
+            .claim_impl(None, super::ClaimParams { queue: "empty".to_string(), wait_ms: Some(20) })
             .await
             .unwrap()
             .0;
@@ -1683,15 +2080,18 @@ mod tests {
     #[tokio::test]
     async fn nack_without_a_matching_lease_is_a_false_not_an_error() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .nack(rmcp::handler::server::wrapper::Parameters(super::NackParams {
-                queue: "orders".to_string(),
-                message_id: qaas_types::MessageId::new().to_string(),
-                lease_token: 0,
-                reason: Some("simulated failure".to_string()),
-            }))
+            .nack_impl(
+                None,
+                super::NackParams {
+                    queue: "orders".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    lease_token: 0,
+                    reason: Some("simulated failure".to_string()),
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1702,16 +2102,14 @@ mod tests {
     #[tokio::test]
     async fn enqueue_with_a_reused_idempotency_key_does_not_create_a_second_message() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
         let params = || super::EnqueueParams {
             idempotency_key: Some("dedup-1".to_string()),
             ..enqueue_params("orders", json!("payload"))
         };
 
-        let first =
-            server.enqueue(rmcp::handler::server::wrapper::Parameters(params())).await.unwrap().0;
-        let second =
-            server.enqueue(rmcp::handler::server::wrapper::Parameters(params())).await.unwrap().0;
+        let first = server.enqueue_impl(None, params()).await.unwrap().0;
+        let second = server.enqueue_impl(None, params()).await.unwrap().0;
 
         assert_eq!(first.message_id, second.message_id);
     }
@@ -1719,14 +2117,9 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_queue_name_is_rejected_before_touching_the_filesystem() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
-        let result = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "../escape",
-                json!("x"),
-            )))
-            .await;
+        let result = server.enqueue_impl(None, enqueue_params("../escape", json!("x"))).await;
 
         // `Json<EnqueueResult>` isn't `Debug` (it's `rmcp`'s wrapper
         // type, not one of ours), so `unwrap_err` isn't available here —
@@ -1740,14 +2133,17 @@ mod tests {
     #[tokio::test]
     async fn an_unconfigured_queue_is_never_throttled() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let enqueued = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                estimated_tokens: Some(1_000_000_000),
-                estimated_cost: Some(1_000_000.0),
-                ..enqueue_params("orders", json!("x"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    estimated_tokens: Some(1_000_000_000),
+                    estimated_cost: Some(1_000_000.0),
+                    ..enqueue_params("orders", json!("x"))
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1758,35 +2154,42 @@ mod tests {
     #[tokio::test]
     async fn enqueue_is_denied_once_the_configured_token_budget_would_be_exceeded() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         server
-            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+            .configure_admission_impl(
+                None,
                 super::ConfigureAdmissionParams {
                     queue: "orders".to_string(),
                     tokens_per_window: Some(100),
                     cost_ceiling_per_window: None,
                     window_seconds: Some(60),
                 },
-            ))
+            )
             .await
             .unwrap();
 
         let first = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                estimated_tokens: Some(80),
-                ..enqueue_params("orders", json!("first"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    estimated_tokens: Some(80),
+                    ..enqueue_params("orders", json!("first"))
+                },
+            )
             .await
             .unwrap()
             .0;
         assert_eq!(first.tokens_remaining, Some(20));
 
         let result = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                estimated_tokens: Some(50),
-                ..enqueue_params("orders", json!("second"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    estimated_tokens: Some(50),
+                    ..enqueue_params("orders", json!("second"))
+                },
+            )
             .await;
 
         let Err(error) = result else {
@@ -1799,33 +2202,31 @@ mod tests {
     #[tokio::test]
     async fn claim_reports_throttled_instead_of_waiting_when_the_queue_is_over_budget() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "orders",
-                json!("a real message, sitting right there"),
-            )))
+            .enqueue_impl(
+                None,
+                enqueue_params("orders", json!("a real message, sitting right there")),
+            )
             .await
             .unwrap();
 
         server
-            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+            .configure_admission_impl(
+                None,
                 super::ConfigureAdmissionParams {
                     queue: "orders".to_string(),
                     tokens_per_window: Some(0),
                     cost_ceiling_per_window: None,
                     window_seconds: Some(60),
                 },
-            ))
+            )
             .await
             .unwrap();
 
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "orders".to_string(),
-                wait_ms: Some(50),
-            }))
+            .claim_impl(None, super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(50) })
             .await
             .unwrap()
             .0;
@@ -1839,33 +2240,38 @@ mod tests {
     #[tokio::test]
     async fn admission_status_reports_configuration_and_live_usage() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         server
-            .configure_admission(rmcp::handler::server::wrapper::Parameters(
+            .configure_admission_impl(
+                None,
                 super::ConfigureAdmissionParams {
                     queue: "orders".to_string(),
                     tokens_per_window: Some(1000),
                     cost_ceiling_per_window: Some(5.0),
                     window_seconds: Some(120),
                 },
-            ))
+            )
             .await
             .unwrap();
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                estimated_tokens: Some(200),
-                estimated_cost: Some(1.5),
-                ..enqueue_params("orders", json!("x"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    estimated_tokens: Some(200),
+                    estimated_cost: Some(1.5),
+                    ..enqueue_params("orders", json!("x"))
+                },
+            )
             .await
             .unwrap();
 
         let status = server
-            .admission_status(rmcp::handler::server::wrapper::Parameters(
+            .admission_status_impl(
+                None,
                 super::AdmissionStatusParams { queue: "orders".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -1882,13 +2288,16 @@ mod tests {
     #[tokio::test]
     async fn near_duplicate_enqueues_collapse_into_the_original() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let first = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![1.0, 0.0, 0.0]),
-                ..enqueue_params("support", json!("please reset my password"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![1.0, 0.0, 0.0]),
+                    ..enqueue_params("support", json!("please reset my password"))
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1899,10 +2308,13 @@ mod tests {
         // Plan.md's line names: another agent independently queuing the
         // same underlying task.
         let second = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![0.999, 0.001, 0.0]),
-                ..enqueue_params("support", json!("can you reset my password please"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![0.999, 0.001, 0.0]),
+                    ..enqueue_params("support", json!("can you reset my password please"))
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1913,75 +2325,90 @@ mod tests {
         assert_eq!(second.tokens_remaining, None, "a collapsed enqueue shouldn't touch admission");
 
         // Only one message actually made it into the queue.
-        let group = server.registry.get("support").await.unwrap();
+        let group = server.registry.get(None, "support").await.unwrap();
         assert_eq!(group.len().await, 1);
     }
 
     #[tokio::test]
     async fn dissimilar_embeddings_do_not_collapse() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![1.0, 0.0]),
-                ..enqueue_params("support", json!("reset my password"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("support", json!("reset my password"))
+                },
+            )
             .await
             .unwrap();
 
         let second = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![0.0, 1.0]),
-                ..enqueue_params("support", json!("cancel my subscription"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![0.0, 1.0]),
+                    ..enqueue_params("support", json!("cancel my subscription"))
+                },
+            )
             .await
             .unwrap()
             .0;
 
         assert!(!second.deduplicated);
-        let group = server.registry.get("support").await.unwrap();
+        let group = server.registry.get(None, "support").await.unwrap();
         assert_eq!(group.len().await, 2);
     }
 
     #[tokio::test]
     async fn acking_a_message_frees_its_embedding_for_reuse_immediately() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let first = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![1.0, 0.0]),
-                ..enqueue_params("support", json!("reset my password"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("support", json!("reset my password"))
+                },
+            )
             .await
             .unwrap()
             .0;
 
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "support".to_string(),
-                wait_ms: Some(100),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "support".to_string(), wait_ms: Some(100) },
+            )
             .await
             .unwrap()
             .0;
         server
-            .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
-                queue: "support".to_string(),
-                message_id: claimed.message_id.unwrap(),
-                lease_token: claimed.lease_token.unwrap(),
-            }))
+            .ack_impl(
+                None,
+                super::AckParams {
+                    queue: "support".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                },
+            )
             .await
             .unwrap();
 
         // The first task is done and gone — a near-identical *new* task
         // must not be silently swallowed as a "duplicate" of it.
         let second = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                embedding: Some(vec![1.0, 0.0]),
-                ..enqueue_params("support", json!("reset my password again"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("support", json!("reset my password again"))
+                },
+            )
             .await
             .unwrap()
             .0;
@@ -1993,13 +2420,13 @@ mod tests {
     #[tokio::test]
     async fn enqueue_without_a_queue_or_embedding_is_rejected() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: None,
-                ..enqueue_params("unused", json!("x"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams { queue: None, ..enqueue_params("unused", json!("x")) },
+            )
             .await;
 
         let Err(error) = result else {
@@ -2011,56 +2438,64 @@ mod tests {
     #[tokio::test]
     async fn enqueue_without_a_queue_routes_to_the_closest_registered_descriptor() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let routes = server
-            .configure_route(rmcp::handler::server::wrapper::Parameters(
+            .configure_route_impl(
+                None,
                 super::ConfigureRouteParams {
                     queue: "billing".to_string(),
                     embedding: vec![1.0, 0.0],
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
         assert_eq!(routes.registered_routes, vec!["billing".to_string()]);
 
         server
-            .configure_route(rmcp::handler::server::wrapper::Parameters(
+            .configure_route_impl(
+                None,
                 super::ConfigureRouteParams {
                     queue: "support".to_string(),
                     embedding: vec![0.0, 1.0],
                 },
-            ))
+            )
             .await
             .unwrap();
 
         let enqueued = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: None,
-                embedding: Some(vec![0.9, 0.1]),
-                ..enqueue_params("unused", json!("a billing question"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    queue: None,
+                    embedding: Some(vec![0.9, 0.1]),
+                    ..enqueue_params("unused", json!("a billing question"))
+                },
+            )
             .await
             .unwrap()
             .0;
 
         assert_eq!(enqueued.queue, "billing");
-        let group = server.registry.get("billing").await.unwrap();
+        let group = server.registry.get(None, "billing").await.unwrap();
         assert_eq!(group.len().await, 1);
     }
 
     #[tokio::test]
     async fn routing_with_no_routes_registered_is_rejected() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(super::EnqueueParams {
-                queue: None,
-                embedding: Some(vec![1.0, 0.0]),
-                ..enqueue_params("unused", json!("x"))
-            }))
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    queue: None,
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("unused", json!("x"))
+                },
+            )
             .await;
 
         let Err(error) = result else {
@@ -2080,11 +2515,12 @@ mod tests {
         )
         .await;
 
-        let server = server(&dir);
+        let server = server(&dir).await;
         let listed = server
-            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+            .list_dead_letters_impl(
+                None,
                 super::ListDeadLettersParams { queue: "doomed".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2102,17 +2538,18 @@ mod tests {
     async fn triaging_as_transient_auto_reprocesses_into_the_live_queue() {
         let dir = tempdir().unwrap();
         let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .triage_dead_letter_impl(
+                None,
                 super::TriageDeadLetterParams {
                     queue: "doomed".to_string(),
                     message_id: id.clone(),
                     classification: super::TriageClassificationParam::Transient,
                     reason: "looks like a rate limit".to_string(),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2123,19 +2560,20 @@ mod tests {
         // Gone from the DLQ, and genuinely claimable again in the live
         // queue - not just marked somehow.
         let listed = server
-            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+            .list_dead_letters_impl(
+                None,
                 super::ListDeadLettersParams { queue: "doomed".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
         assert!(listed.is_empty());
 
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "doomed".to_string(),
-                wait_ms: Some(500),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "doomed".to_string(), wait_ms: Some(500) },
+            )
             .await
             .unwrap()
             .0;
@@ -2147,17 +2585,18 @@ mod tests {
     async fn triaging_as_permanent_holds_and_annotates_without_reprocessing() {
         let dir = tempdir().unwrap();
         let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .triage_dead_letter_impl(
+                None,
                 super::TriageDeadLetterParams {
                     queue: "doomed".to_string(),
                     message_id: id.clone(),
                     classification: super::TriageClassificationParam::Permanent,
                     reason: "malformed input, will never succeed".to_string(),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2166,9 +2605,10 @@ mod tests {
         assert!(!result.reprocessed, "permanent must never auto-reprocess");
 
         let listed = server
-            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+            .list_dead_letters_impl(
+                None,
                 super::ListDeadLettersParams { queue: "doomed".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2181,17 +2621,18 @@ mod tests {
     #[tokio::test]
     async fn triaging_an_unknown_id_is_not_annotated() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .triage_dead_letter_impl(
+                None,
                 super::TriageDeadLetterParams {
                     queue: "doomed".to_string(),
                     message_id: qaas_types::MessageId::new().to_string(),
                     classification: super::TriageClassificationParam::Transient,
                     reason: "no such entry".to_string(),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2204,21 +2645,23 @@ mod tests {
     async fn reprocess_dead_letter_works_directly_without_triage() {
         let dir = tempdir().unwrap();
         let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .reprocess_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .reprocess_dead_letter_impl(
+                None,
                 super::DeadLetterActionParams { queue: "doomed".to_string(), message_id: id },
-            ))
+            )
             .await
             .unwrap()
             .0;
         assert!(result.reprocessed);
 
         let listed = server
-            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+            .list_dead_letters_impl(
+                None,
                 super::ListDeadLettersParams { queue: "doomed".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2229,21 +2672,23 @@ mod tests {
     async fn purge_dead_letter_discards_it_for_good() {
         let dir = tempdir().unwrap();
         let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .purge_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .purge_dead_letter_impl(
+                None,
                 super::DeadLetterActionParams { queue: "doomed".to_string(), message_id: id },
-            ))
+            )
             .await
             .unwrap()
             .0;
         assert!(result.purged);
 
         let listed = server
-            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+            .list_dead_letters_impl(
+                None,
                 super::ListDeadLettersParams { queue: "doomed".to_string() },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2258,15 +2703,16 @@ mod tests {
     #[tokio::test]
     async fn purging_an_unknown_id_is_a_false_not_an_error() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .purge_dead_letter(rmcp::handler::server::wrapper::Parameters(
+            .purge_dead_letter_impl(
+                None,
                 super::DeadLetterActionParams {
                     queue: "doomed".to_string(),
                     message_id: qaas_types::MessageId::new().to_string(),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2276,26 +2722,21 @@ mod tests {
     #[tokio::test]
     async fn published_chunks_are_returned_in_order_by_stream_partial_results() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
-        server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "narration",
-                json!("start"),
-            )))
-            .await
-            .unwrap();
+        let server = server(&dir).await;
+        server.enqueue_impl(None, enqueue_params("narration", json!("start"))).await.unwrap();
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "narration".to_string(),
-                wait_ms: Some(500),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "narration".to_string(), wait_ms: Some(500) },
+            )
             .await
             .unwrap()
             .0;
 
         for (chunk, is_final) in [("once", false), ("upon", false), ("a time", true)] {
             let result = server
-                .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                .publish_partial_result_impl(
+                    None,
                     super::PublishPartialResultParams {
                         queue: "narration".to_string(),
                         message_id: claimed.message_id.clone().unwrap(),
@@ -2303,7 +2744,7 @@ mod tests {
                         data: json!(chunk),
                         is_final: Some(is_final),
                     },
-                ))
+                )
                 .await
                 .unwrap()
                 .0;
@@ -2311,14 +2752,15 @@ mod tests {
         }
 
         let streamed = server
-            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+            .stream_partial_results_impl(
+                None,
                 super::StreamPartialResultsParams {
                     queue: "narration".to_string(),
                     message_id: claimed.message_id.clone().unwrap(),
                     after_sequence: None,
                     wait_ms: Some(200),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2335,26 +2777,21 @@ mod tests {
     #[tokio::test]
     async fn stream_partial_results_only_returns_chunks_newer_than_after_sequence() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
-        server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "narration",
-                json!("x"),
-            )))
-            .await
-            .unwrap();
+        let server = server(&dir).await;
+        server.enqueue_impl(None, enqueue_params("narration", json!("x"))).await.unwrap();
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "narration".to_string(),
-                wait_ms: Some(500),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "narration".to_string(), wait_ms: Some(500) },
+            )
             .await
             .unwrap()
             .0;
 
         for chunk in ["one", "two"] {
             server
-                .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                .publish_partial_result_impl(
+                    None,
                     super::PublishPartialResultParams {
                         queue: "narration".to_string(),
                         message_id: claimed.message_id.clone().unwrap(),
@@ -2362,20 +2799,21 @@ mod tests {
                         data: json!(chunk),
                         is_final: None,
                     },
-                ))
+                )
                 .await
                 .unwrap();
         }
 
         let streamed = server
-            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+            .stream_partial_results_impl(
+                None,
                 super::StreamPartialResultsParams {
                     queue: "narration".to_string(),
                     message_id: claimed.message_id.unwrap(),
                     after_sequence: Some(1),
                     wait_ms: Some(200),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2388,17 +2826,18 @@ mod tests {
     #[tokio::test]
     async fn stream_partial_results_reports_inactive_for_a_never_claimed_message() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let streamed = server
-            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+            .stream_partial_results_impl(
+                None,
                 super::StreamPartialResultsParams {
                     queue: "narration".to_string(),
                     message_id: qaas_types::MessageId::new().to_string(),
                     after_sequence: None,
                     wait_ms: Some(50),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2410,25 +2849,20 @@ mod tests {
     #[tokio::test]
     async fn stream_partial_results_reports_inactive_once_the_lease_ends() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
-        server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "narration",
-                json!("x"),
-            )))
-            .await
-            .unwrap();
+        let server = server(&dir).await;
+        server.enqueue_impl(None, enqueue_params("narration", json!("x"))).await.unwrap();
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "narration".to_string(),
-                wait_ms: Some(500),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "narration".to_string(), wait_ms: Some(500) },
+            )
             .await
             .unwrap()
             .0;
 
         server
-            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+            .publish_partial_result_impl(
+                None,
                 super::PublishPartialResultParams {
                     queue: "narration".to_string(),
                     message_id: claimed.message_id.clone().unwrap(),
@@ -2436,27 +2870,31 @@ mod tests {
                     data: json!("in progress"),
                     is_final: None,
                 },
-            ))
+            )
             .await
             .unwrap();
         server
-            .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
-                queue: "narration".to_string(),
-                message_id: claimed.message_id.clone().unwrap(),
-                lease_token: claimed.lease_token.unwrap(),
-            }))
+            .ack_impl(
+                None,
+                super::AckParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.clone().unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                },
+            )
             .await
             .unwrap();
 
         let streamed = server
-            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+            .stream_partial_results_impl(
+                None,
                 super::StreamPartialResultsParams {
                     queue: "narration".to_string(),
                     message_id: claimed.message_id.unwrap(),
                     after_sequence: None,
                     wait_ms: Some(50),
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
@@ -2468,19 +2906,13 @@ mod tests {
     #[tokio::test]
     async fn stream_partial_results_waits_for_a_chunk_published_after_the_call_starts() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
-        server
-            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
-                "narration",
-                json!("x"),
-            )))
-            .await
-            .unwrap();
+        let server = server(&dir).await;
+        server.enqueue_impl(None, enqueue_params("narration", json!("x"))).await.unwrap();
         let claimed = server
-            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
-                queue: "narration".to_string(),
-                wait_ms: Some(500),
-            }))
+            .claim_impl(
+                None,
+                super::ClaimParams { queue: "narration".to_string(), wait_ms: Some(500) },
+            )
             .await
             .unwrap()
             .0;
@@ -2490,14 +2922,15 @@ mod tests {
             let message_id = claimed.message_id.clone().unwrap();
             tokio::spawn(async move {
                 server
-                    .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                    .stream_partial_results_impl(
+                        None,
                         super::StreamPartialResultsParams {
                             queue: "narration".to_string(),
                             message_id,
                             after_sequence: None,
                             wait_ms: Some(5000),
                         },
-                    ))
+                    )
                     .await
                     .unwrap()
                     .0
@@ -2506,7 +2939,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         server
-            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+            .publish_partial_result_impl(
+                None,
                 super::PublishPartialResultParams {
                     queue: "narration".to_string(),
                     message_id: claimed.message_id.unwrap(),
@@ -2514,7 +2948,7 @@ mod tests {
                     data: json!("finally"),
                     is_final: Some(true),
                 },
-            ))
+            )
             .await
             .unwrap();
 
@@ -2529,10 +2963,11 @@ mod tests {
     #[tokio::test]
     async fn publishing_with_a_stale_lease_token_has_no_effect() {
         let dir = tempdir().unwrap();
-        let server = server(&dir);
+        let server = server(&dir).await;
 
         let result = server
-            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+            .publish_partial_result_impl(
+                None,
                 super::PublishPartialResultParams {
                     queue: "narration".to_string(),
                     message_id: qaas_types::MessageId::new().to_string(),
@@ -2540,12 +2975,220 @@ mod tests {
                     data: json!("nobody's listening"),
                     is_final: None,
                 },
-            ))
+            )
             .await
             .unwrap()
             .0;
 
         assert!(!result.published);
         assert_eq!(result.sequence, None);
+    }
+
+    #[tokio::test]
+    async fn tenants_with_the_same_queue_name_never_see_each_others_messages() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+
+        server
+            .enqueue_impl(Some(tenant_a.clone()), enqueue_params("orders", json!("a's task")))
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(Some(tenant_b.clone()), enqueue_params("orders", json!("b's task")))
+            .await
+            .unwrap();
+
+        // Tenant B's claim on "orders" must return B's own task, never A's.
+        let claimed_by_b = server
+            .claim_impl(
+                Some(tenant_b),
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(50) },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(claimed_by_b.payload, Some(json!("b's task")));
+
+        // The trusted stdio connection (tenant: None) has its own, third
+        // "orders" queue - distinct from either tenant's, not a shared
+        // fallback either of them can reach.
+        let claimed_over_stdio = server
+            .claim_impl(None, super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(20) })
+            .await
+            .unwrap()
+            .0;
+        assert!(!claimed_over_stdio.available);
+
+        // Tenant A's own "orders" queue still has exactly its own task
+        // waiting - untouched by B's enqueue or claim.
+        let claimed_by_a = server
+            .claim_impl(
+                Some(tenant_a),
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(20) },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(claimed_by_a.payload, Some(json!("a's task")));
+    }
+
+    #[tokio::test]
+    async fn a_tenant_can_never_claim_a_message_enqueued_by_a_different_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+        let tenant_b = TenantId::new("tenant-b").unwrap();
+
+        server
+            .enqueue_impl(Some(tenant_b), enqueue_params("orders", json!("b's task")))
+            .await
+            .unwrap();
+
+        let claimed_by_a = server
+            .claim_impl(
+                Some(tenant_a),
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(20) },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(!claimed_by_a.available, "tenant A must not see tenant B's message");
+    }
+
+    #[tokio::test]
+    async fn routing_descriptors_are_scoped_per_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant_a = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_route_impl(
+                Some(tenant_a.clone()),
+                super::ConfigureRouteParams {
+                    queue: "support".to_string(),
+                    embedding: vec![1.0, 0.0],
+                },
+            )
+            .await
+            .unwrap();
+
+        // The same descriptor is unregistered for a different caller
+        // (here, the trusted stdio connection) - routing must fail for
+        // it rather than silently reusing tenant A's route table.
+        let stdio_routing_result = server
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    queue: None,
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("unused", json!("x"))
+                },
+            )
+            .await;
+        assert!(stdio_routing_result.is_err());
+
+        // Tenant A's own enqueue, by contrast, resolves via the route it
+        // just registered.
+        let routed = server
+            .enqueue_impl(
+                Some(tenant_a),
+                super::EnqueueParams {
+                    queue: None,
+                    embedding: Some(vec![1.0, 0.0]),
+                    ..enqueue_params("unused", json!("x"))
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(routed.queue, "support");
+    }
+
+    #[tokio::test]
+    async fn create_api_key_is_rejected_for_a_caller_already_authenticated_over_http() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let already_authenticated = TenantId::new("tenant-a").unwrap();
+
+        let result = server
+            .create_api_key_impl(
+                Some(already_authenticated),
+                super::CreateApiKeyParams { tenant_id: "tenant-b".to_string() },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_api_key_over_stdio_mints_a_credential_that_authenticates_as_its_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let minted = server
+            .create_api_key_impl(
+                None,
+                super::CreateApiKeyParams { tenant_id: "tenant-a".to_string() },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(minted.tenant_id, "tenant-a");
+
+        let resolved = server.api_keys.authenticate(&minted.api_key).await;
+        assert_eq!(resolved, Some(TenantId::new("tenant-a").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_is_rejected_for_a_caller_already_authenticated_over_http() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let already_authenticated = TenantId::new("tenant-a").unwrap();
+
+        let minted = server
+            .create_api_key_impl(
+                None,
+                super::CreateApiKeyParams { tenant_id: "tenant-a".to_string() },
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let result = server
+            .revoke_api_key_impl(
+                Some(already_authenticated),
+                super::RevokeApiKeyParams { api_key: minted.api_key },
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_over_stdio_makes_the_key_stop_authenticating() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let minted = server
+            .create_api_key_impl(
+                None,
+                super::CreateApiKeyParams { tenant_id: "tenant-a".to_string() },
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let revoked = server
+            .revoke_api_key_impl(
+                None,
+                super::RevokeApiKeyParams { api_key: minted.api_key.clone() },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(revoked.revoked);
+
+        let resolved = server.api_keys.authenticate(&minted.api_key).await;
+        assert_eq!(resolved, None);
     }
 }
