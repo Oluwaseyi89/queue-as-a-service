@@ -7,11 +7,26 @@
 //! decides when [`RetryPolicy`](crate::RetryPolicy) considers a message
 //! exhausted, and it's the one that knows how to put a dead letter's
 //! item back into a live queue on reprocessing. Keeping this type
-//! ignorant of all that is what lets it double as the foundation for
-//! `feature/llm-assisted-dlq-triage` (Phase 4) later — a triage agent
-//! wants to list, inspect, and resolve dead letters, which is exactly
-//! this type's whole API, without needing to know anything about
-//! `ConsumerGroup`'s internals either.
+//! ignorant of all that is what let it double as the foundation for
+//! `feature/llm-assisted-dlq-triage` (Phase 4): a triage agent lists,
+//! inspects, and resolves dead letters, which was already this type's
+//! whole API — [`annotate`](DeadLetterQueue::annotate) is the one
+//! genuinely new operation that branch adds, letting a verdict attach to
+//! an entry *without* resolving it, the same "record something durably
+//! without ending this entry's life" shape
+//! [`ConsumerGroup::checkpoint`](crate::ConsumerGroup::checkpoint)
+//! already has for a live message's lease.
+//!
+//! [`DeadLetter::checkpoint`] is the other piece `feature/llm-assisted-dlq-triage`
+//! adds: whatever a workflow last saved via `ConsumerGroup::checkpoint`
+//! before this delivery exhausted its retries, carried onto the dead
+//! letter itself. `feature/durable-agent-workflows` deliberately dropped
+//! this on the exhausted path when it first threaded `checkpoint` through
+//! — see `ConsumerGroup::resolve_failed_delivery`'s docs — precisely
+//! because *this* is the branch whose entire point is making dead letters
+//! diagnosable: knowing a workflow died on step 4 of 5 (an API call) versus
+//! step 1 (argument validation) is exactly the signal a triage
+//! classification needs, human or agent.
 
 use std::collections::HashMap;
 use std::io;
@@ -20,14 +35,14 @@ use std::path::Path;
 use qaas_types::{IdempotencyKey, MessageId, Timestamp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::wal::Wal;
 
 /// A message that exhausted its retry policy, with enough context to
-/// let an operator — or, eventually, an LLM triage agent — decide what
-/// to do with it: inspect why it failed, reprocess it, or discard it for
-/// good.
+/// let an operator — or an LLM triage agent — decide what to do with it:
+/// inspect why it failed, reprocess it, or discard it for good.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadLetter<T> {
     /// The message's original identity, preserved from its first
@@ -55,6 +70,50 @@ pub struct DeadLetter<T> {
     pub last_error: Option<String>,
     /// When this message was dead-lettered.
     pub dead_lettered_at: Timestamp,
+    /// Whatever was last saved via
+    /// [`ConsumerGroup::checkpoint`](crate::ConsumerGroup::checkpoint)
+    /// for this message before the delivery that exhausted its retries —
+    /// `None` if it was never checkpointed. See this module's own docs
+    /// for why this matters for triage specifically.
+    pub checkpoint: Option<Value>,
+    /// A triage agent's (or a human's) verdict on this failure, if one
+    /// has been recorded via [`DeadLetterQueue::annotate`]. `None` until
+    /// something triages it.
+    pub triage: Option<TriageVerdict>,
+}
+
+/// Whether a dead-lettered failure looks worth retrying automatically, or
+/// needs a person to look at it before anything happens to it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriageClassification {
+    /// Looks like a failure that might well succeed on a fresh attempt —
+    /// a rate limit, a timeout, a downstream blip. Safe to retry
+    /// automatically; this classification is what
+    /// `qaas-server`'s `triage_dead_letter` tool treats as "auto-apply
+    /// reprocessing."
+    Transient,
+    /// Looks like a failure that will keep failing no matter how many
+    /// times it's retried — bad input, a genuine bug, a business-rule
+    /// rejection. Deliberately never auto-resolved by this crate: a
+    /// permanent failure is held, annotated, in the DLQ until a human
+    /// decides to reprocess it anyway or purge it — never silently
+    /// discarded just because something classified it this way. See
+    /// `qaas-server`'s `triage_dead_letter` docs for why auto-purge
+    /// specifically is off the table.
+    Permanent,
+}
+
+/// A recorded triage verdict on a [`DeadLetter`] — see
+/// [`DeadLetterQueue::annotate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriageVerdict {
+    /// The classification itself.
+    pub classification: TriageClassification,
+    /// Why — whatever explanation the triage agent or human gave.
+    /// Free-form; this crate has no opinion on its shape.
+    pub reason: String,
+    /// When this verdict was recorded.
+    pub triaged_at: Timestamp,
 }
 
 /// One entry in a [`DeadLetterQueue`]'s WAL.
@@ -67,6 +126,11 @@ enum WalRecord<T> {
     /// letter," and preserving *why* it left is an audit-log concern
     /// (`feature/structured-audit-logging`), not this branch's.
     Remove(MessageId),
+    /// A triage verdict was attached to an existing dead letter, via
+    /// [`DeadLetterQueue::annotate`]. Replayed as a no-op if the entry
+    /// it names isn't present — see that method's own docs on the one
+    /// narrow, harmless race that can produce exactly that.
+    Annotate(MessageId, TriageVerdict),
 }
 
 /// A durable, inspectable set of [`DeadLetter`] records.
@@ -93,6 +157,11 @@ impl<T: Serialize + DeserializeOwned> DeadLetterQueue<T> {
                 }
                 WalRecord::Remove(id) => {
                     entries.remove(&id);
+                }
+                WalRecord::Annotate(id, verdict) => {
+                    if let Some(entry) = entries.get_mut(&id) {
+                        entry.triage = Some(verdict);
+                    }
                 }
             }
         }
@@ -175,13 +244,55 @@ impl<T: Serialize + DeserializeOwned> DeadLetterQueue<T> {
         self.wal.append(&WalRecord::Remove(id)).await?;
         Ok(Some(dead_letter))
     }
+
+    /// Durably attaches `verdict` to the dead letter `id`, without
+    /// resolving it — it stays exactly where it was, just with a triage
+    /// verdict now visible on it. Returns `Ok(false)` without effect if
+    /// no dead letter with `id` currently exists (already reprocessed or
+    /// purged, or never existed).
+    ///
+    /// There's one narrow, harmless race here, the same shape documented
+    /// on [`ConsumerGroup::checkpoint`](crate::ConsumerGroup::checkpoint):
+    /// `id` is checked before the (async, fsync-backed) WAL write and
+    /// again after, and if a concurrent [`take`](Self::take) removed it
+    /// in between, this still returns `Ok(false)` — the entry genuinely
+    /// wasn't annotated — even though `verdict` was already durably
+    /// written by then. That stray record is harmless: replay only
+    /// applies an `Annotate` record to an entry that still exists (see
+    /// [`open`](Self::open)), so a dangling one for an id that's since
+    /// been removed simply does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL write fails; `verdict` is not
+    /// recorded in that case, and the entry (if it still exists) is left
+    /// exactly as it was before this call.
+    pub async fn annotate(&self, id: MessageId, verdict: TriageVerdict) -> io::Result<bool> {
+        {
+            let entries = self.entries.lock().await;
+            if !entries.contains_key(&id) {
+                return Ok(false);
+            }
+        }
+
+        self.wal.append(&WalRecord::Annotate(id, verdict.clone())).await?;
+
+        let mut entries = self.entries.lock().await;
+        match entries.get_mut(&id) {
+            Some(entry) => {
+                entry.triage = Some(verdict);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
-    use super::{DeadLetter, DeadLetterQueue};
+    use super::{DeadLetter, DeadLetterQueue, TriageClassification, TriageVerdict};
     use qaas_types::{MessageId, Timestamp};
 
     fn sample(id: MessageId, item: i32) -> DeadLetter<i32> {
@@ -192,7 +303,13 @@ mod tests {
             delivery_count: 5,
             last_error: Some("downstream returned 429".to_string()),
             dead_lettered_at: Timestamp::now(),
+            checkpoint: None,
+            triage: None,
         }
+    }
+
+    fn verdict(classification: TriageClassification, reason: &str) -> TriageVerdict {
+        TriageVerdict { classification, reason: reason.to_string(), triaged_at: Timestamp::now() }
     }
 
     #[tokio::test]
@@ -262,5 +379,105 @@ mod tests {
 
         let entries = dlq.ids_and_keys().await;
         assert_eq!(entries, vec![(id, Some(key))]);
+    }
+
+    #[tokio::test]
+    async fn annotate_attaches_a_verdict_without_removing_the_entry() {
+        let dir = tempdir().unwrap();
+        let dlq = DeadLetterQueue::open(dir.path().join("dlq.log")).await.unwrap();
+        let id = MessageId::new();
+        dlq.record(sample(id, 1)).await.unwrap();
+
+        let applied = dlq
+            .annotate(id, verdict(TriageClassification::Transient, "looks like a rate limit"))
+            .await
+            .unwrap();
+        assert!(applied);
+
+        assert_eq!(dlq.len().await, 1, "annotating must not resolve the entry");
+        let listed = dlq.list().await;
+        let triage = listed[0].triage.as_ref().unwrap();
+        assert_eq!(triage.classification, TriageClassification::Transient);
+        assert_eq!(triage.reason, "looks like a rate limit");
+    }
+
+    #[tokio::test]
+    async fn annotating_an_unknown_id_is_a_false_not_an_error() {
+        let dir = tempdir().unwrap();
+        let dlq = DeadLetterQueue::<i32>::open(dir.path().join("dlq.log")).await.unwrap();
+        let applied = dlq
+            .annotate(MessageId::new(), verdict(TriageClassification::Permanent, "no such entry"))
+            .await
+            .unwrap();
+        assert!(!applied);
+    }
+
+    #[tokio::test]
+    async fn a_later_annotation_replaces_an_earlier_one() {
+        let dir = tempdir().unwrap();
+        let dlq = DeadLetterQueue::open(dir.path().join("dlq.log")).await.unwrap();
+        let id = MessageId::new();
+        dlq.record(sample(id, 1)).await.unwrap();
+
+        dlq.annotate(id, verdict(TriageClassification::Transient, "first guess")).await.unwrap();
+        dlq.annotate(id, verdict(TriageClassification::Permanent, "actually, no")).await.unwrap();
+
+        let listed = dlq.list().await;
+        let triage = listed[0].triage.as_ref().unwrap();
+        assert_eq!(triage.classification, TriageClassification::Permanent);
+        assert_eq!(triage.reason, "actually, no");
+    }
+
+    #[tokio::test]
+    async fn a_triage_verdict_survives_reopening_the_same_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dlq.log");
+        let id = MessageId::new();
+        {
+            let dlq = DeadLetterQueue::open(&path).await.unwrap();
+            dlq.record(sample(id, 1)).await.unwrap();
+            dlq.annotate(id, verdict(TriageClassification::Permanent, "bad input")).await.unwrap();
+        }
+
+        let recovered = DeadLetterQueue::<i32>::open(&path).await.unwrap();
+        let listed = recovered.list().await;
+        let triage = listed[0].triage.as_ref().unwrap();
+        assert_eq!(triage.classification, TriageClassification::Permanent);
+        assert_eq!(triage.reason, "bad input");
+    }
+
+    #[tokio::test]
+    async fn a_dangling_annotation_for_an_already_removed_entry_replays_as_a_no_op() {
+        // Reproduces the race `annotate`'s own docs describe: a WAL can
+        // end up with an `Annotate` record for an id that's since been
+        // removed. Replay must not resurrect the entry or panic on it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dlq.log");
+        let id = MessageId::new();
+        {
+            let dlq = DeadLetterQueue::open(&path).await.unwrap();
+            dlq.record(sample(id, 1)).await.unwrap();
+            dlq.annotate(id, verdict(TriageClassification::Transient, "will be removed"))
+                .await
+                .unwrap();
+            dlq.take(id).await.unwrap();
+        }
+
+        let recovered = DeadLetterQueue::<i32>::open(&path).await.unwrap();
+        assert!(recovered.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_carries_onto_the_dead_letter() {
+        let dir = tempdir().unwrap();
+        let dlq = DeadLetterQueue::open(dir.path().join("dlq.log")).await.unwrap();
+        let id = MessageId::new();
+
+        let mut entry = sample(id, 1);
+        entry.checkpoint = Some(serde_json::json!({"completed_steps": ["fetch"]}));
+        dlq.record(entry).await.unwrap();
+
+        let listed = dlq.list().await;
+        assert_eq!(listed[0].checkpoint, Some(serde_json::json!({"completed_steps": ["fetch"]})));
     }
 }
