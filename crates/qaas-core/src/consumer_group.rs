@@ -77,6 +77,21 @@
 //! second delivery-lifecycle verb next to `ack`/`nack` — exactly the
 //! "without a separate workflow engine" framing this branch's own
 //! `Plan.md` entry asks for.
+//!
+//! Streaming (`feature/streaming-delivery`) is checkpointing's mirror
+//! image, not a variation on it: [`checkpoint`](ConsumerGroup::checkpoint)
+//! is durable, resumable *input*-side state — what a retried delivery
+//! picks back up. [`publish_partial_result`](ConsumerGroup::publish_partial_result)
+//! is ephemeral, in-memory-only *output*-side broadcast — a live feed of
+//! a delivery's progress (an LLM call's tokens arriving one at a time,
+//! say) that [`partial_results_since`](ConsumerGroup::partial_results_since)
+//! lets any caller watch, not just whoever holds the lease. It doesn't
+//! survive this lease ending, however it ends, on purpose: there is
+//! nothing to resume a broadcast *into* the way there's something to
+//! resume a checkpoint into, so persisting it (durably, in the WAL,
+//! at whatever frequency an LLM streams tokens) would be pure waste
+//! with no corresponding benefit. See that method's own docs for the
+//! full reasoning.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -170,6 +185,14 @@ struct Leased<T> {
     /// [`ConsumerGroup::checkpoint`] — unlike every other field here,
     /// this one can change without the lease itself changing.
     checkpoint: Option<Value>,
+    /// Partial results published so far via
+    /// [`ConsumerGroup::publish_partial_result`] — see that method's own
+    /// docs for why, unlike `checkpoint`, this is deliberately
+    /// *in-memory only* and does not survive this lease ending, however
+    /// it ends. Append-only within a lease's lifetime; a fresh lease
+    /// (a redelivery, however it was triggered) always starts with an
+    /// empty one, never inheriting a previous attempt's chunks.
+    stream: Vec<StreamChunk>,
 }
 
 /// A message that failed a delivery attempt (nack or lease expiry) and
@@ -249,6 +272,45 @@ impl LeaseToken {
     pub fn from_u64(value: u64) -> Self {
         Self(value)
     }
+}
+
+/// One published partial result — see
+/// [`ConsumerGroup::publish_partial_result`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamChunk {
+    /// Position within this lease's stream, starting at 1 and
+    /// incrementing by one per published chunk — lets a caller ask for
+    /// "everything after N" via
+    /// [`partial_results_since`](ConsumerGroup::partial_results_since)
+    /// without re-fetching chunks it's already seen.
+    pub sequence: u64,
+    /// The chunk's own content. Any JSON value; this crate doesn't
+    /// interpret it, same as a message payload.
+    pub data: Value,
+    /// Whether the publisher considers this the last chunk it will ever
+    /// publish for this delivery. Advisory only — nothing in this crate
+    /// enforces it or refuses chunks published after one marked final;
+    /// a caller lying about this only misleads whoever's watching, not
+    /// this type's own bookkeeping.
+    pub is_final: bool,
+}
+
+/// The result of
+/// [`ConsumerGroup::partial_results_since`](ConsumerGroup::partial_results_since)
+/// once it has something to report.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartialResultsPoll {
+    /// One or more chunks with `sequence` greater than what was asked
+    /// for, in order.
+    Chunks(Vec<StreamChunk>),
+    /// `id` doesn't currently name an active lease — never claimed yet,
+    /// or the delivery that held it has already ended (acked, nacked, or
+    /// expired). Deliberately not two separate outcomes: from a watcher's
+    /// perspective both mean "nothing more is coming through this
+    /// mechanism right now," and distinguishing "not started" from
+    /// "already finished" is exactly what the last chunk's own
+    /// `is_final` flag is for, not this type.
+    NotActive,
 }
 
 /// A successfully claimed message, returned by [`ConsumerGroup::claim`].
@@ -604,6 +666,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                         delivery_count,
                         idempotency_key: idempotency_key.clone(),
                         checkpoint: checkpoint.clone(),
+                        stream: Vec::new(),
                     },
                 );
                 drop(state);
@@ -798,6 +861,79 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
             // `state` is durably recorded either way, but the in-memory
             // lease is no longer this caller's to update.
             _ => Ok(false),
+        }
+    }
+
+    /// Appends `data` as the next chunk in `id`'s stream of partial
+    /// results, if `token` names its currently-active lease.
+    ///
+    /// Unlike [`checkpoint`](Self::checkpoint), this is deliberately
+    /// *not* durable — no WAL write, nothing survives a restart or even
+    /// this lease ending. `checkpoint` exists so a *retried* delivery can
+    /// resume where a *previous* one left off; a stream of partial
+    /// results is the opposite kind of thing, a live broadcast of one
+    /// specific delivery's progress as it happens (an LLM call's tokens
+    /// arriving one at a time, say) that has no meaning to resume —
+    /// a redelivery starts a fresh attempt with a fresh, empty stream,
+    /// not a continuation of whatever the last attempt had streamed so
+    /// far. Persisting high-frequency, small, disposable chunks to the
+    /// WAL would also just be waste: durability exists here to survive a
+    /// crash, and there is nothing to resume into after one.
+    ///
+    /// Returns the sequence number assigned to this chunk, or `None`
+    /// without effect if `id`/`token` don't name a currently-active
+    /// lease — the same stale-lease handling every other lease-scoped
+    /// method here has, just returning `Option<u64>` instead of `bool`
+    /// since there's a real value to report on success.
+    pub async fn publish_partial_result(
+        &self,
+        id: MessageId,
+        token: LeaseToken,
+        data: Value,
+        is_final: bool,
+    ) -> Option<u64> {
+        let mut state = self.state.lock().await;
+        let lease = state.leased.get_mut(&id)?;
+        if lease.token != token {
+            return None;
+        }
+        let sequence = u64::try_from(lease.stream.len()).unwrap_or(u64::MAX) + 1;
+        lease.stream.push(StreamChunk { sequence, data, is_final });
+        drop(state);
+        // Multiple callers could be watching this (or a different)
+        // message's stream at once — wake all of them to recheck their
+        // own condition, the same "don't just notify_one" reasoning
+        // `reclaim_expired_leases` already documents for itself.
+        self.changed.notify_waiters();
+        Some(sequence)
+    }
+
+    /// Waits until `id`'s stream has at least one chunk with `sequence`
+    /// greater than `after`, or its lease is no longer active — whichever
+    /// happens first — and reports which. Returns immediately if chunks
+    /// past `after` are already available; blocks (with no internal
+    /// timeout, the same as [`claim`](Self::claim) — a caller wanting a
+    /// bounded wait wraps this the same way `qaas-server` wraps `claim`)
+    /// otherwise.
+    ///
+    /// `after` need not have come from a chunk this method itself
+    /// returned — `0` naturally means "everything so far," useful for a
+    /// watcher that starts observing partway through a delivery it
+    /// didn't see the start of.
+    pub async fn partial_results_since(&self, id: MessageId, after: u64) -> PartialResultsPoll {
+        loop {
+            let state = self.state.lock().await;
+            let Some(lease) = state.leased.get(&id) else {
+                return PartialResultsPoll::NotActive;
+            };
+            let chunks: Vec<StreamChunk> =
+                lease.stream.iter().filter(|chunk| chunk.sequence > after).cloned().collect();
+            drop(state);
+
+            if !chunks.is_empty() {
+                return PartialResultsPoll::Chunks(chunks);
+            }
+            self.changed.notified().await;
         }
     }
 
@@ -1094,7 +1230,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::ConsumerGroup;
+    use super::{ConsumerGroup, PartialResultsPoll};
     use crate::retry::RetryPolicy;
 
     /// Generous enough that a test asserting "this should NOT have
@@ -1247,6 +1383,167 @@ mod tests {
         assert!(group.nack(second.id, second.token, None).await.unwrap());
         let redelivered = group.claim().await;
         assert_eq!(redelivered.checkpoint, Some(legitimate));
+    }
+
+    #[tokio::test]
+    async fn published_chunks_are_returned_in_order_with_increasing_sequence_numbers() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        let first = group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("chunk one"), false)
+            .await
+            .unwrap();
+        let second = group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("chunk two"), true)
+            .await
+            .unwrap();
+        assert_eq!((first, second), (1, 2));
+
+        let PartialResultsPoll::Chunks(chunks) = group.partial_results_since(claim.id, 0).await
+        else {
+            panic!("expected chunks, the lease is still active");
+        };
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].sequence, 1);
+        assert_eq!(chunks[0].data, serde_json::json!("chunk one"));
+        assert!(!chunks[0].is_final);
+        assert_eq!(chunks[1].sequence, 2);
+        assert!(chunks[1].is_final);
+    }
+
+    #[tokio::test]
+    async fn partial_results_since_only_returns_what_is_newer_than_asked_for() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("one"), false)
+            .await
+            .unwrap();
+        group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("two"), false)
+            .await
+            .unwrap();
+
+        let PartialResultsPoll::Chunks(chunks) = group.partial_results_since(claim.id, 1).await
+        else {
+            panic!("expected chunks");
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn partial_results_since_waits_for_the_next_chunk_rather_than_returning_empty() {
+        let dir = tempdir().unwrap();
+        let group = Arc::new(open(&dir, LONG_TIMEOUT).await);
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        let waiter = {
+            let group = Arc::clone(&group);
+            tokio::spawn(async move { group.partial_results_since(claim.id, 0).await })
+        };
+
+        // Give the waiter a real chance to actually be blocked in
+        // `.notified().await` before publishing — this is the scenario
+        // that matters (arriving *after* the wait has started), not just
+        // "the data happened to already be there."
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("finally"), true)
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("partial_results_since should have woken up once a chunk was published")
+            .unwrap();
+        let PartialResultsPoll::Chunks(chunks) = outcome else {
+            panic!("expected chunks");
+        };
+        assert_eq!(chunks[0].data, serde_json::json!("finally"));
+    }
+
+    #[tokio::test]
+    async fn publishing_with_a_stale_token_has_no_effect() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, SHORT_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let first = group.claim().await;
+        tokio::time::sleep(SHORT_TIMEOUT * 3).await;
+        let _second = group.claim().await;
+
+        let result = group
+            .publish_partial_result(first.id, first.token, serde_json::json!("too late"), false)
+            .await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_do_not_survive_the_lease_that_produced_them() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("in progress"), false)
+            .await
+            .unwrap();
+        assert!(group.ack(claim.id, claim.token).await.unwrap());
+
+        // Deliberate, documented behavior — see publish_partial_result's
+        // own docs on why this is ephemeral, not durable: a resolved
+        // lease's stream is simply gone, not archived anywhere.
+        assert_eq!(group.partial_results_since(claim.id, 0).await, PartialResultsPoll::NotActive);
+    }
+
+    #[tokio::test]
+    async fn a_redelivery_starts_with_an_empty_stream_not_the_previous_attempts() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, SHORT_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let first = group.claim().await;
+        group
+            .publish_partial_result(
+                first.id,
+                first.token,
+                serde_json::json!("first attempt"),
+                false,
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(SHORT_TIMEOUT * 3).await;
+
+        let second = group.claim().await;
+        assert_eq!(second.id, first.id);
+
+        let sequence = group
+            .publish_partial_result(
+                second.id,
+                second.token,
+                serde_json::json!("second attempt"),
+                false,
+            )
+            .await
+            .unwrap();
+        // If the first attempt's chunk had carried over, this would be 2.
+        assert_eq!(sequence, 1, "a redelivery must start counting from a fresh, empty stream");
+
+        let PartialResultsPoll::Chunks(chunks) = group.partial_results_since(second.id, 0).await
+        else {
+            panic!("expected chunks");
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data, serde_json::json!("second attempt"));
     }
 
     #[tokio::test]
