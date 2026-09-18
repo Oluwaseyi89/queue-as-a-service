@@ -121,8 +121,19 @@
 //! phase's running "durable, resumable everything" theme deliberately
 //! breaks, and the doc comment explains why that's the right call rather
 //! than an inconsistency.
+//!
+//! [`auth`] opens Phase 5 with the identity this project's first
+//! untrusted caller needs: [`auth::TenantId`], and a durable
+//! [`auth::ApiKeyStore`] mapping a hashed credential to one. Unlike
+//! everything Phase 4 added, an API key is meant to outlive a restart —
+//! see the module's own docs for why it gets a `Wal` when routes and
+//! admission budgets deliberately didn't. JWT verification, the other
+//! credential `feature/api-auth` supports, lives in `qaas-server`
+//! instead: it needs real cryptography and is fundamentally about an
+//! HTTP header, neither of which belongs in a crate with no networking.
 
 pub mod admission;
+pub mod auth;
 pub mod circuit_breaker;
 pub mod consumer_group;
 pub mod dead_letter;
@@ -133,6 +144,7 @@ pub mod semantic;
 pub mod wal;
 
 pub use admission::{AdmissionConfig, AdmissionController, AdmissionDecision, UsageSnapshot};
+pub use auth::{ApiKeyStore, InvalidTenantId, TenantId};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitState, FallbackCache,
     HybridGuard, HybridOutcome,
