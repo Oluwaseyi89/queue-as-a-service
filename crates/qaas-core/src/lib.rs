@@ -100,6 +100,18 @@
 //! keyed by `MessageId` for collapsing near-duplicate tasks before they
 //! ever reach `ConsumerGroup` — same domain-agnostic-core split as
 //! `circuit_breaker` and `admission` again.
+//!
+//! `feature/llm-assisted-dlq-triage` closes out Phase 4 back in
+//! [`dead_letter`], the module that's been carrying a note pointing at
+//! this branch since `feature/dead-letter-queue` first wrote it:
+//! [`DeadLetterQueue::annotate`] lets a verdict attach to a dead letter
+//! without resolving it — the same "durable, doesn't end this entry's
+//! life" shape `ConsumerGroup::checkpoint` already has for a live
+//! message's lease — and [`DeadLetter::checkpoint`] finally carries a
+//! workflow's last-saved progress onto the dead letter itself, which
+//! `feature/durable-agent-workflows` deliberately deferred to here. Both
+//! exist for the same reason: a triage verdict is only as good as what
+//! it has to go on.
 
 pub mod admission;
 pub mod circuit_breaker;
@@ -117,7 +129,7 @@ pub use circuit_breaker::{
     HybridGuard, HybridOutcome,
 };
 pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
-pub use dead_letter::{DeadLetter, DeadLetterQueue};
+pub use dead_letter::{DeadLetter, DeadLetterQueue, TriageClassification, TriageVerdict};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
 pub use retry::RetryPolicy;
 pub use semantic::{Embedding, EmbeddingIndex, InvalidEmbedding};
