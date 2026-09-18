@@ -101,17 +101,26 @@
 //! ever reach `ConsumerGroup` — same domain-agnostic-core split as
 //! `circuit_breaker` and `admission` again.
 //!
-//! `feature/llm-assisted-dlq-triage` closes out Phase 4 back in
-//! [`dead_letter`], the module that's been carrying a note pointing at
-//! this branch since `feature/dead-letter-queue` first wrote it:
-//! [`DeadLetterQueue::annotate`] lets a verdict attach to a dead letter
-//! without resolving it — the same "durable, doesn't end this entry's
-//! life" shape `ConsumerGroup::checkpoint` already has for a live
-//! message's lease — and [`DeadLetter::checkpoint`] finally carries a
-//! workflow's last-saved progress onto the dead letter itself, which
+//! `feature/llm-assisted-dlq-triage` lands back in [`dead_letter`], the
+//! module that's been carrying a note pointing at this branch since
+//! `feature/dead-letter-queue` first wrote it: [`DeadLetterQueue::annotate`]
+//! lets a verdict attach to a dead letter without resolving it — the
+//! same "durable, doesn't end this entry's life" shape
+//! `ConsumerGroup::checkpoint` already has for a live message's lease —
+//! and [`DeadLetter::checkpoint`] finally carries a workflow's
+//! last-saved progress onto the dead letter itself, which
 //! `feature/durable-agent-workflows` deliberately deferred to here. Both
 //! exist for the same reason: a triage verdict is only as good as what
 //! it has to go on.
+//!
+//! `feature/streaming-delivery` is Phase 4's actual closer, and its
+//! whole addition is one method pair on [`ConsumerGroup`], not a new
+//! module: [`ConsumerGroup::publish_partial_result`] and
+//! [`ConsumerGroup::partial_results_since`]. See that method's own docs
+//! for why it's ephemeral rather than durable — the one place this
+//! phase's running "durable, resumable everything" theme deliberately
+//! breaks, and the doc comment explains why that's the right call rather
+//! than an inconsistency.
 
 pub mod admission;
 pub mod circuit_breaker;
@@ -128,7 +137,7 @@ pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitState, FallbackCache,
     HybridGuard, HybridOutcome,
 };
-pub use consumer_group::{Claim, ConsumerGroup, LeaseToken};
+pub use consumer_group::{Claim, ConsumerGroup, LeaseToken, PartialResultsPoll, StreamChunk};
 pub use dead_letter::{DeadLetter, DeadLetterQueue, TriageClassification, TriageVerdict};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
 pub use retry::RetryPolicy;
