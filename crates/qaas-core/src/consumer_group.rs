@@ -90,7 +90,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
 
-use crate::dead_letter::{DeadLetter, DeadLetterQueue};
+use crate::dead_letter::{DeadLetter, DeadLetterQueue, TriageVerdict};
 use crate::retry::RetryPolicy;
 use crate::wal::Wal;
 
@@ -891,15 +891,18 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// WAL-backed operation in this crate already has (`enqueue`,
     /// `ack`), not a special case invented here.
     ///
-    /// `checkpoint` is dropped, not carried into the [`DeadLetter`], on
-    /// the exhausted path — a deliberate, documented scope cut, not an
-    /// oversight: giving dead letters their own view into a workflow's
-    /// last-saved progress is squarely `feature/llm-assisted-dlq-triage`'s
-    /// job (a later branch whose entire point is making dead letters
-    /// diagnosable), not this one's. On the retry path, `checkpoint`
-    /// *is* carried forward into the [`Delayed`] entry — a message that
-    /// hasn't exhausted its retries yet is still the *same* in-progress
-    /// workflow, not a new one.
+    /// `checkpoint` is carried onto the [`DeadLetter`] on the exhausted
+    /// path (`feature/llm-assisted-dlq-triage`) — whatever a workflow
+    /// last saved before this delivery gave up is exactly the signal a
+    /// triage verdict needs: a message that died on step 4 of 5 reads
+    /// very differently from one that died on step 1. On the retry path,
+    /// `checkpoint` is carried forward into the [`Delayed`] entry
+    /// instead — a message that hasn't exhausted its retries yet is
+    /// still the *same* in-progress workflow, not a new one. Either way
+    /// the message keeps whatever progress it made; the two paths just
+    /// differ in *where* that progress ends up (a still-live entry
+    /// that'll be claimed again, versus a terminal one a triage agent or
+    /// human inspects).
     ///
     /// The dead-letter path does two durable writes, not one: the DLQ's
     /// own record, then a [`WalRecord::DeadLettered`] in *this* group's
@@ -937,6 +940,8 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
                     delivery_count,
                     last_error: reason,
                     dead_lettered_at: Timestamp::now(),
+                    checkpoint,
+                    triage: None,
                 })
                 .await?;
             self.wal.append(&WalRecord::DeadLettered(id)).await
@@ -1012,6 +1017,29 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         T: Clone,
     {
         self.dlq.list().await
+    }
+
+    /// Durably attaches a triage verdict to the dead letter `id`,
+    /// without resolving it — see
+    /// [`DeadLetterQueue::annotate`](crate::dead_letter::DeadLetterQueue::annotate)'s
+    /// own docs for the exact semantics (including the one narrow race
+    /// it documents). `qaas-server`'s `triage_dead_letter` tool is what
+    /// actually decides *what* to do with a verdict once it's recorded
+    /// here — a [`TriageClassification::Transient`](crate::dead_letter::TriageClassification::Transient)
+    /// one is what that tool auto-applies
+    /// [`reprocess_dead_letter`](Self::reprocess_dead_letter) for; this
+    /// method itself has no opinion on that, the same way `checkpoint`
+    /// has no opinion on what a caller does with a saved workflow state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DLQ's WAL write fails.
+    pub async fn annotate_dead_letter(
+        &self,
+        id: MessageId,
+        verdict: TriageVerdict,
+    ) -> io::Result<bool> {
+        self.dlq.annotate(id, verdict).await
     }
 
     /// Takes the dead letter with `id` out of the DLQ and durably
