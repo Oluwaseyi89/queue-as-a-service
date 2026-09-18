@@ -1,7 +1,8 @@
 //! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`,
 //! `checkpoint`, `configure_admission`, `admission_status`,
 //! `configure_route`, `list_dead_letters`, `triage_dead_letter`,
-//! `reprocess_dead_letter`, `purge_dead_letter`.
+//! `reprocess_dead_letter`, `purge_dead_letter`, `publish_partial_result`,
+//! `stream_partial_results`.
 //!
 //! This is the branch's whole point — an agent runtime that already
 //! speaks MCP (Claude Code, Claude Desktop, any other MCP client) can
@@ -181,6 +182,32 @@
 //!   of the `ConsumerGroup` methods of the same name, for a human (or an
 //!   agent) that's already decided without going through triage's
 //!   classify-then-explain ceremony.
+//!
+//! # Streaming delivery (`feature/streaming-delivery`)
+//!
+//! `publish_partial_result` and `stream_partial_results` expose
+//! `qaas_core::ConsumerGroup`'s new partial-result methods directly —
+//! see that module's own docs for why the underlying primitive is
+//! deliberately ephemeral (in-memory only, gone once the lease that
+//! produced it ends) rather than durable like everything else this
+//! server persists.
+//!
+//! This is "SSE/WebSocket delivery" in spirit, not on the wire: this
+//! project has had exactly one network listener — none — since
+//! `feature/mcp-server-interface` deliberately deferred one until
+//! `feature/api-auth` exists, and this branch lands *before* that one.
+//! Opening a raw HTTP/SSE socket now would mean the first unauthenticated
+//! network listener in the project's history, for a project whose own
+//! prior branch called that "a real, not hypothetical, security hole."
+//! Instead, streaming happens over the exact same stdio MCP connection
+//! every other tool here already uses: `stream_partial_results` is a
+//! bounded-wait poll (`wait_ms`, same shape as `claim`'s) rather than a
+//! server-initiated push, which is what actually makes incremental
+//! delivery possible over a synchronous request/response tool-call
+//! transport without inventing a second connection or a notification
+//! protocol this SDK doesn't hand us for free. A caller that wants
+//! near-real-time updates just calls it in a loop, passing back the
+//! highest `sequence` it's already seen each time.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -189,7 +216,8 @@ use std::time::Duration;
 
 use qaas_core::{
     AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, Embedding,
-    EmbeddingIndex, LeaseToken, RetryPolicy, TriageClassification, TriageVerdict,
+    EmbeddingIndex, LeaseToken, PartialResultsPoll, RetryPolicy, TriageClassification,
+    TriageVerdict,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
@@ -578,6 +606,85 @@ struct CheckpointResult {
     /// even though this returns `false` — see `qaas_core::ConsumerGroup::checkpoint`'s
     /// own docs.
     checkpointed: bool,
+}
+
+/// Arguments for the `publish_partial_result` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PublishPartialResultParams {
+    /// Which queue the message was claimed from.
+    queue: String,
+    /// The message id from a prior `claim` call.
+    message_id: String,
+    /// The lease token from that same `claim` call.
+    lease_token: u64,
+    /// This chunk's content, any JSON value — a token, a line, a partial
+    /// object, whatever unit makes sense for what's being streamed.
+    data: serde_json::Value,
+    /// Whether this is the last chunk you'll publish for this delivery.
+    /// Defaults to `false` if omitted — most published chunks are
+    /// intermediate, so a caller streaming many of them only needs to
+    /// say this once, on the last one.
+    is_final: Option<bool>,
+}
+
+/// Result of the `publish_partial_result` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct PublishPartialResultResult {
+    /// `false` means this id/token pair no longer matched an active
+    /// lease, and `data` was not recorded — same stale-lease semantics
+    /// as `ack`/`nack`/`checkpoint`.
+    published: bool,
+    /// This chunk's position in the stream (starting at 1), if
+    /// published. `null` if not.
+    sequence: Option<u64>,
+}
+
+/// Arguments for the `stream_partial_results` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StreamPartialResultsParams {
+    /// Which queue the message was claimed from.
+    queue: String,
+    /// The message id to watch. No lease token needed — watching a
+    /// stream doesn't require holding the lease, only publishing to one
+    /// does.
+    message_id: String,
+    /// Only return chunks with a sequence number greater than this.
+    /// Defaults to 0 (everything published so far) if omitted; pass the
+    /// highest `sequence` you've already seen to only get what's new.
+    after_sequence: Option<u64>,
+    /// How long to wait for at least one new chunk if none are
+    /// available yet, in milliseconds. Defaults to 5000; capped at
+    /// 60000 — the same bounds `claim`'s `wait_ms` has, for the same
+    /// reason.
+    wait_ms: Option<u64>,
+}
+
+/// One chunk in `stream_partial_results`' result.
+#[derive(Debug, Serialize, JsonSchema)]
+struct PartialResultChunkSummary {
+    /// This chunk's position in the stream, starting at 1.
+    sequence: u64,
+    /// The chunk's own content, exactly as published.
+    data: serde_json::Value,
+    /// Whether the publisher marked this as the last chunk it would
+    /// publish. Advisory, not enforced — see
+    /// `qaas_core::StreamChunk::is_final`'s own docs.
+    is_final: bool,
+}
+
+/// Result of the `stream_partial_results` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct StreamPartialResultsResult {
+    /// Whether `message_id` currently names an active lease. `false`
+    /// means either it's never been claimed yet, or whatever delivery
+    /// held it has already ended (acked, nacked, or expired) — `chunks`
+    /// is always empty in that case. `true` with empty `chunks` means
+    /// the lease is active but nothing new arrived within `wait_ms`;
+    /// call again with the same `after_sequence`.
+    active: bool,
+    /// New chunks since `after_sequence`, in order. Empty if none
+    /// arrived in time, or if `active` is `false`.
+    chunks: Vec<PartialResultChunkSummary>,
 }
 
 /// Arguments for the `configure_admission` tool.
@@ -1058,6 +1165,78 @@ impl QaasMcpServer {
         Ok(Json(CheckpointResult { checkpointed }))
     }
 
+    /// Publishes the next chunk of a still-claimed message's partial
+    /// results, without resolving it.
+    #[tool(description = "Publish the next chunk of a still-claimed message's partial results - \
+                        e.g. one token or line at a time from a streaming LLM call - without \
+                        resolving it. Mark the last chunk with is_final: true. Watchers see \
+                        chunks via stream_partial_results.")]
+    async fn publish_partial_result(
+        &self,
+        Parameters(params): Parameters<PublishPartialResultParams>,
+    ) -> Result<Json<PublishPartialResultResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let token = LeaseToken::from_u64(params.lease_token);
+
+        let sequence = group
+            .publish_partial_result(
+                message_id,
+                token,
+                params.data,
+                params.is_final.unwrap_or(false),
+            )
+            .await;
+        Ok(Json(PublishPartialResultResult { published: sequence.is_some(), sequence }))
+    }
+
+    /// Waits for and returns new partial-result chunks for a message.
+    #[tool(
+        description = "Wait for (up to wait_ms) and return new partial-result chunks published \
+                        for a message since after_sequence - no lease token needed, watching \
+                        doesn't require holding the lease. active: false means the message was \
+                        never claimed, or the delivery that held it has already ended; \
+                        active: true with empty chunks means still in progress with nothing new \
+                        yet. Call again with the highest sequence you've seen to keep watching."
+    )]
+    async fn stream_partial_results(
+        &self,
+        Parameters(params): Parameters<StreamPartialResultsParams>,
+    ) -> Result<Json<StreamPartialResultsResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let after = params.after_sequence.unwrap_or(0);
+        let wait =
+            params.wait_ms.map_or(DEFAULT_CLAIM_WAIT, Duration::from_millis).min(MAX_CLAIM_WAIT);
+
+        let (active, chunks) = match tokio::time::timeout(
+            wait,
+            group.partial_results_since(message_id, after),
+        )
+        .await
+        {
+            Ok(PartialResultsPoll::Chunks(chunks)) => (true, chunks),
+            Ok(PartialResultsPoll::NotActive) => (false, Vec::new()),
+            // Timed out waiting: the poll only ever blocks once it's
+            // confirmed the lease is active (`NotActive` returns
+            // immediately, never reaching the timeout) - so a
+            // timeout here always means "active, nothing new yet."
+            Err(_elapsed) => (true, Vec::new()),
+        };
+
+        Ok(Json(StreamPartialResultsResult {
+            active,
+            chunks: chunks
+                .into_iter()
+                .map(|chunk| PartialResultChunkSummary {
+                    sequence: chunk.sequence,
+                    data: chunk.data,
+                    is_final: chunk.is_final,
+                })
+                .collect(),
+        }))
+    }
+
     /// Sets or clears a queue's token/cost admission budget.
     #[tool(description = "Set (or clear) a queue's token/cost admission budget: a sliding window \
                         that continuously refills as time passes, not a one-time allowance. \
@@ -1268,7 +1447,11 @@ impl QaasMcpServer {
                     classify each one (transient/permanent, with a reason) - transient \
                     auto-reprocesses back into the live queue, permanent stays held for a human; \
                     reprocess_dead_letter and purge_dead_letter are also available directly \
-                    without going through triage."
+                    without going through triage. For a long-running task, call \
+                    publish_partial_result after each incremental step (e.g. each token from a \
+                    streaming LLM call) without resolving the message; another caller watches \
+                    with stream_partial_results, passing after_sequence to only get what's new \
+                    and calling it again in a loop for near-real-time updates."
 )]
 impl ServerHandler for QaasMcpServer {}
 
@@ -2088,5 +2271,281 @@ mod tests {
             .unwrap()
             .0;
         assert!(!result.purged);
+    }
+
+    #[tokio::test]
+    async fn published_chunks_are_returned_in_order_by_stream_partial_results() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "narration",
+                json!("start"),
+            )))
+            .await
+            .unwrap();
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "narration".to_string(),
+                wait_ms: Some(500),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        for (chunk, is_final) in [("once", false), ("upon", false), ("a time", true)] {
+            let result = server
+                .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                    super::PublishPartialResultParams {
+                        queue: "narration".to_string(),
+                        message_id: claimed.message_id.clone().unwrap(),
+                        lease_token: claimed.lease_token.unwrap(),
+                        data: json!(chunk),
+                        is_final: Some(is_final),
+                    },
+                ))
+                .await
+                .unwrap()
+                .0;
+            assert!(result.published);
+        }
+
+        let streamed = server
+            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                super::StreamPartialResultsParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.clone().unwrap(),
+                    after_sequence: None,
+                    wait_ms: Some(200),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(streamed.active);
+        assert_eq!(streamed.chunks.len(), 3);
+        assert_eq!(streamed.chunks[0].sequence, 1);
+        assert_eq!(streamed.chunks[0].data, json!("once"));
+        assert!(!streamed.chunks[0].is_final);
+        assert_eq!(streamed.chunks[2].sequence, 3);
+        assert!(streamed.chunks[2].is_final);
+    }
+
+    #[tokio::test]
+    async fn stream_partial_results_only_returns_chunks_newer_than_after_sequence() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "narration",
+                json!("x"),
+            )))
+            .await
+            .unwrap();
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "narration".to_string(),
+                wait_ms: Some(500),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        for chunk in ["one", "two"] {
+            server
+                .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                    super::PublishPartialResultParams {
+                        queue: "narration".to_string(),
+                        message_id: claimed.message_id.clone().unwrap(),
+                        lease_token: claimed.lease_token.unwrap(),
+                        data: json!(chunk),
+                        is_final: None,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+
+        let streamed = server
+            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                super::StreamPartialResultsParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    after_sequence: Some(1),
+                    wait_ms: Some(200),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(streamed.chunks.len(), 1);
+        assert_eq!(streamed.chunks[0].sequence, 2);
+        assert_eq!(streamed.chunks[0].data, json!("two"));
+    }
+
+    #[tokio::test]
+    async fn stream_partial_results_reports_inactive_for_a_never_claimed_message() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let streamed = server
+            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                super::StreamPartialResultsParams {
+                    queue: "narration".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    after_sequence: None,
+                    wait_ms: Some(50),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!streamed.active);
+        assert!(streamed.chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_partial_results_reports_inactive_once_the_lease_ends() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "narration",
+                json!("x"),
+            )))
+            .await
+            .unwrap();
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "narration".to_string(),
+                wait_ms: Some(500),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        server
+            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                super::PublishPartialResultParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.clone().unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                    data: json!("in progress"),
+                    is_final: None,
+                },
+            ))
+            .await
+            .unwrap();
+        server
+            .ack(rmcp::handler::server::wrapper::Parameters(super::AckParams {
+                queue: "narration".to_string(),
+                message_id: claimed.message_id.clone().unwrap(),
+                lease_token: claimed.lease_token.unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let streamed = server
+            .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                super::StreamPartialResultsParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    after_sequence: None,
+                    wait_ms: Some(50),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!streamed.active, "the lease that produced this stream is gone");
+        assert!(streamed.chunks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_partial_results_waits_for_a_chunk_published_after_the_call_starts() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+        server
+            .enqueue(rmcp::handler::server::wrapper::Parameters(enqueue_params(
+                "narration",
+                json!("x"),
+            )))
+            .await
+            .unwrap();
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "narration".to_string(),
+                wait_ms: Some(500),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let watcher = {
+            let server = server.clone();
+            let message_id = claimed.message_id.clone().unwrap();
+            tokio::spawn(async move {
+                server
+                    .stream_partial_results(rmcp::handler::server::wrapper::Parameters(
+                        super::StreamPartialResultsParams {
+                            queue: "narration".to_string(),
+                            message_id,
+                            after_sequence: None,
+                            wait_ms: Some(5000),
+                        },
+                    ))
+                    .await
+                    .unwrap()
+                    .0
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server
+            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                super::PublishPartialResultParams {
+                    queue: "narration".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                    data: json!("finally"),
+                    is_final: Some(true),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let streamed = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("stream_partial_results should have woken up once a chunk was published")
+            .unwrap();
+        assert_eq!(streamed.chunks.len(), 1);
+        assert_eq!(streamed.chunks[0].data, json!("finally"));
+    }
+
+    #[tokio::test]
+    async fn publishing_with_a_stale_lease_token_has_no_effect() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .publish_partial_result(rmcp::handler::server::wrapper::Parameters(
+                super::PublishPartialResultParams {
+                    queue: "narration".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    lease_token: 0,
+                    data: json!("nobody's listening"),
+                    is_final: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!result.published);
+        assert_eq!(result.sequence, None);
     }
 }
