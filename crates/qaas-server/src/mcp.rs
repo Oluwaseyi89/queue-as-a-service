@@ -1,6 +1,7 @@
 //! Exposes the queue as MCP tools: `enqueue`, `claim`, `ack`, `nack`,
 //! `checkpoint`, `configure_admission`, `admission_status`,
-//! `configure_route`.
+//! `configure_route`, `list_dead_letters`, `triage_dead_letter`,
+//! `reprocess_dead_letter`, `purge_dead_letter`.
 //!
 //! This is the branch's whole point — an agent runtime that already
 //! speaks MCP (Claude Code, Claude Desktop, any other MCP client) can
@@ -146,6 +147,40 @@
 //! this branch, not configurable per queue — the same "doesn't add
 //! configurability its underlying engine doesn't already have" stance
 //! `VISIBILITY_TIMEOUT` already takes.
+//!
+//! # LLM-assisted DLQ triage (`feature/llm-assisted-dlq-triage`)
+//!
+//! Every prior branch that mentioned the DLQ pointed here — `ConsumerGroup`
+//! has had `dead_letters`/`reprocess_dead_letter`/`purge_dead_letter`
+//! since `feature/dead-letter-queue`, but nothing exposed them over MCP
+//! until now. Four new tools:
+//!
+//! - `list_dead_letters` — every dead letter on a queue, including its
+//!   `checkpoint` (`feature/durable-agent-workflows`'s workflow state,
+//!   finally carried onto the dead letter itself — see
+//!   `qaas_core::dead_letter`'s own docs) and any existing `triage`
+//!   verdict. What a triage agent (or a human) reads before deciding
+//!   anything.
+//! - `triage_dead_letter` — the tool this branch is named for: records a
+//!   classification (`transient` or `permanent`) and a reason via
+//!   `qaas_core::ConsumerGroup::annotate_dead_letter`, then *auto-applies
+//!   the matching policy* — `transient` immediately calls
+//!   `reprocess_dead_letter` internally; `permanent` does nothing further,
+//!   leaving the entry annotated and in the DLQ. Deliberately asymmetric:
+//!   reprocessing is reversible (a message that shouldn't have been
+//!   retried just fails and comes back to the DLQ again), so auto-applying
+//!   it from a classification is a reasonable bet. Purging is not
+//!   reversible, so this tool never does it, no matter how confident a
+//!   `permanent` classification is — `Plan.md`'s own wording for this
+//!   branch calls that bucket "needs-human," not "needs deletion," and a
+//!   destructive action a person didn't directly trigger has no place
+//!   here. A human (or an agent a human is supervising) who agrees a
+//!   `permanent` entry is worth discarding calls `purge_dead_letter`
+//!   separately, as its own explicit action.
+//! - `reprocess_dead_letter` / `purge_dead_letter` — direct MCP exposure
+//!   of the `ConsumerGroup` methods of the same name, for a human (or an
+//!   agent) that's already decided without going through triage's
+//!   classify-then-explain ceremony.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -154,7 +189,7 @@ use std::time::Duration;
 
 use qaas_core::{
     AdmissionConfig, AdmissionController, AdmissionDecision, ConsumerGroup, Embedding,
-    EmbeddingIndex, LeaseToken, RetryPolicy,
+    EmbeddingIndex, LeaseToken, RetryPolicy, TriageClassification, TriageVerdict,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
@@ -628,6 +663,136 @@ struct ConfigureRouteResult {
     registered_routes: Vec<String>,
 }
 
+/// Arguments for the `list_dead_letters` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListDeadLettersParams {
+    /// Which queue's dead-letter queue to list.
+    queue: String,
+}
+
+/// One entry in `list_dead_letters`' result.
+#[derive(Debug, Serialize, JsonSchema)]
+struct DeadLetterSummary {
+    /// This message's id — pass it to `triage_dead_letter`,
+    /// `reprocess_dead_letter`, or `purge_dead_letter`.
+    message_id: String,
+    /// The message payload, exactly as originally enqueued.
+    payload: serde_json::Value,
+    /// How many times this message was delivered in total before it was
+    /// dead-lettered.
+    delivery_count: u32,
+    /// The failure reason from whichever delivery attempt exhausted the
+    /// retry policy — the caller's own `nack` reason, or a synthetic one
+    /// if it was a silent lease expiry. `null` if none was given.
+    last_error: Option<String>,
+    /// When this message was dead-lettered, in milliseconds since the
+    /// Unix epoch.
+    dead_lettered_at_ms: u64,
+    /// Whatever this workflow last saved via `checkpoint` before the
+    /// delivery that exhausted its retries — `null` if it was never
+    /// checkpointed. Often the most useful triage signal there is: a
+    /// task that died on a late step reads very differently from one
+    /// that died on the first.
+    checkpoint: Option<serde_json::Value>,
+    /// An existing triage verdict, if `triage_dead_letter` has already
+    /// classified this entry — `null` otherwise.
+    triage: Option<TriageSummary>,
+}
+
+/// A recorded triage verdict, as returned by `list_dead_letters`.
+#[derive(Debug, Serialize, JsonSchema)]
+struct TriageSummary {
+    /// `"transient"` or `"permanent"`.
+    classification: String,
+    /// Why.
+    reason: String,
+    /// When this verdict was recorded, in milliseconds since the Unix
+    /// epoch.
+    triaged_at_ms: u64,
+}
+
+/// Arguments for the `triage_dead_letter` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TriageDeadLetterParams {
+    /// Which queue the dead letter is on.
+    queue: String,
+    /// The dead letter's id, from `list_dead_letters`.
+    message_id: String,
+    /// Whether this failure looks worth retrying automatically
+    /// (`"transient"`) or needs a human to look at it before anything
+    /// happens to it again (`"permanent"`). See this module's docs for
+    /// exactly what each one auto-applies.
+    classification: TriageClassificationParam,
+    /// Why — whatever explanation led to this classification. Recorded
+    /// alongside the verdict for whoever looks at this entry next.
+    reason: String,
+}
+
+/// Wire form of [`TriageClassification`] — kept separate from the
+/// `qaas-core` type rather than deriving `schemars::JsonSchema` directly
+/// on it, matching every other tool parameter in this module: `qaas-core`
+/// doesn't depend on `schemars`, and shouldn't just to satisfy this one
+/// call site's wire schema.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TriageClassificationParam {
+    Transient,
+    Permanent,
+}
+
+impl From<TriageClassificationParam> for TriageClassification {
+    fn from(value: TriageClassificationParam) -> Self {
+        match value {
+            TriageClassificationParam::Transient => Self::Transient,
+            TriageClassificationParam::Permanent => Self::Permanent,
+        }
+    }
+}
+
+/// Result of the `triage_dead_letter` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct TriageDeadLetterResult {
+    /// `false` means no dead letter with `message_id` exists on this
+    /// queue (already resolved, or never dead-lettered) — the verdict
+    /// was not recorded and nothing was reprocessed. Not an error: the
+    /// same "already gone" stance `ack`/`nack` already take on a stale
+    /// lease.
+    annotated: bool,
+    /// `true` if `classification` was `"transient"` and this call also
+    /// auto-applied `reprocess_dead_letter` — the message is back in the
+    /// live queue and no longer in the DLQ. Always `false` for
+    /// `"permanent"`, and for a `"transient"` verdict recorded on an
+    /// entry that (in a narrow race) was resolved by something else
+    /// between the annotation and the reprocess attempt.
+    reprocessed: bool,
+}
+
+/// Arguments shared by `reprocess_dead_letter` and `purge_dead_letter`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeadLetterActionParams {
+    /// Which queue the dead letter is on.
+    queue: String,
+    /// The dead letter's id, from `list_dead_letters`.
+    message_id: String,
+}
+
+/// Result of the `reprocess_dead_letter` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ReprocessDeadLetterResult {
+    /// `false` means no dead letter with `message_id` exists on this
+    /// queue — same "already gone" stance as everywhere else in this
+    /// module.
+    reprocessed: bool,
+}
+
+/// Result of the `purge_dead_letter` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct PurgeDeadLetterResult {
+    /// `false` means no dead letter with `message_id` exists on this
+    /// queue.
+    purged: bool,
+}
+
 /// The MCP server itself. Cheap to clone — the only state is an `Arc`'d
 /// [`QueueRegistry`] — which `rmcp` relies on internally when handling
 /// more than one tool call concurrently over the same connection.
@@ -971,6 +1136,115 @@ impl QaasMcpServer {
 
         Ok(Json(ConfigureRouteResult { registered_routes }))
     }
+
+    /// Lists every dead letter currently on a queue.
+    #[tool(description = "List every dead letter currently on a queue, including its last \
+                        checkpoint (if any) and any existing triage verdict - what a triage \
+                        agent reads before deciding anything.")]
+    async fn list_dead_letters(
+        &self,
+        Parameters(params): Parameters<ListDeadLettersParams>,
+    ) -> Result<Json<Vec<DeadLetterSummary>>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let dead_letters = group.dead_letters().await;
+
+        Ok(Json(
+            dead_letters
+                .into_iter()
+                .map(|dead_letter| DeadLetterSummary {
+                    message_id: dead_letter.id.to_string(),
+                    payload: dead_letter.item,
+                    delivery_count: dead_letter.delivery_count,
+                    last_error: dead_letter.last_error,
+                    dead_lettered_at_ms: dead_letter.dead_lettered_at.0,
+                    checkpoint: dead_letter.checkpoint,
+                    triage: dead_letter.triage.map(|verdict| TriageSummary {
+                        classification: match verdict.classification {
+                            TriageClassification::Transient => "transient".to_string(),
+                            TriageClassification::Permanent => "permanent".to_string(),
+                        },
+                        reason: verdict.reason,
+                        triaged_at_ms: verdict.triaged_at.0,
+                    }),
+                })
+                .collect(),
+        ))
+    }
+
+    /// Classifies a dead letter and auto-applies the matching policy.
+    #[tool(
+        description = "Classify a dead letter as transient (worth retrying) or permanent (needs \
+                        a human), with a reason, and auto-apply the matching policy: transient \
+                        immediately reprocesses the message back into the live queue; permanent \
+                        leaves it annotated in the DLQ for a human - never auto-purged, \
+                        regardless of confidence."
+    )]
+    async fn triage_dead_letter(
+        &self,
+        Parameters(params): Parameters<TriageDeadLetterParams>,
+    ) -> Result<Json<TriageDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let classification: TriageClassification = params.classification.into();
+        let verdict = TriageVerdict {
+            classification,
+            reason: params.reason,
+            triaged_at: qaas_types::Timestamp::now(),
+        };
+
+        let annotated = group
+            .annotate_dead_letter(message_id, verdict)
+            .await
+            .map_err(|error| io_error_to_mcp(&error))?;
+        if !annotated {
+            return Ok(Json(TriageDeadLetterResult { annotated: false, reprocessed: false }));
+        }
+
+        let reprocessed = if matches!(classification, TriageClassification::Transient) {
+            group
+                .reprocess_dead_letter(message_id)
+                .await
+                .map_err(|error| io_error_to_mcp(&error))?
+        } else {
+            false
+        };
+
+        Ok(Json(TriageDeadLetterResult { annotated: true, reprocessed }))
+    }
+
+    /// Reprocesses a dead letter directly, without going through triage.
+    #[tool(
+        description = "Reprocess a dead letter directly, without going through triage - puts it \
+                        back in the live queue for another delivery attempt."
+    )]
+    async fn reprocess_dead_letter(
+        &self,
+        Parameters(params): Parameters<DeadLetterActionParams>,
+    ) -> Result<Json<ReprocessDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let reprocessed = group
+            .reprocess_dead_letter(message_id)
+            .await
+            .map_err(|error| io_error_to_mcp(&error))?;
+        Ok(Json(ReprocessDeadLetterResult { reprocessed }))
+    }
+
+    /// Permanently discards a dead letter.
+    #[tool(
+        description = "Permanently discard a dead letter - it will not be reprocessed. The only \
+                        destructive DLQ action this server has; nothing auto-applies it."
+    )]
+    async fn purge_dead_letter(
+        &self,
+        Parameters(params): Parameters<DeadLetterActionParams>,
+    ) -> Result<Json<PurgeDeadLetterResult>, ErrorData> {
+        let group = self.registry.get(&params.queue).await?;
+        let message_id = parse_message_id(&params.message_id)?;
+        let purged =
+            group.purge_dead_letter(message_id).await.map_err(|error| io_error_to_mcp(&error))?;
+        Ok(Json(PurgeDeadLetterResult { purged }))
+    }
 }
 
 #[tool_handler(
@@ -989,12 +1263,19 @@ impl QaasMcpServer {
                     waiting when the queue is currently over budget. Pass embedding (a vector from \
                     your own embedding model) to enqueue to collapse near-duplicate tasks into an \
                     existing one automatically, or omit queue entirely to have the task routed to \
-                    the closest match among queues registered via configure_route."
+                    the closest match among queues registered via configure_route. Use \
+                    list_dead_letters to see what's failed permanently, and triage_dead_letter to \
+                    classify each one (transient/permanent, with a reason) - transient \
+                    auto-reprocesses back into the live queue, permanent stays held for a human; \
+                    reprocess_dead_letter and purge_dead_letter are also available directly \
+                    without going through triage."
 )]
 impl ServerHandler for QaasMcpServer {}
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1002,6 +1283,44 @@ mod tests {
 
     fn server(dir: &tempfile::TempDir) -> QaasMcpServer {
         QaasMcpServer::new(dir.path())
+    }
+
+    /// Dead-letters a message directly through `qaas-core`, bypassing
+    /// the MCP layer entirely — the registry always opens queues with
+    /// `RetryPolicy::DEFAULT` (five attempts, real backoff delays), and
+    /// walking a message through five real claim/nack cycles just to
+    /// test triage would make every test here take several real seconds
+    /// for no reason. Opening the same WAL path the registry would lazily
+    /// open on first reference, with a policy that exhausts after one
+    /// attempt instead, gets a real dead letter (not a faked-up struct)
+    /// sitting on disk before the server ever touches this queue —
+    /// `list_dead_letters`/`triage_dead_letter`/etc. find it exactly the
+    /// way they'd find one that arrived through real MCP traffic.
+    async fn seed_a_dead_letter(
+        dir: &tempfile::TempDir,
+        queue: &str,
+        payload: serde_json::Value,
+        checkpoint: Option<serde_json::Value>,
+    ) -> String {
+        let path = dir.path().join(format!("{queue}.wal"));
+        let exhausts_immediately = super::RetryPolicy {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            multiplier: 1.0,
+            jitter: 0.0,
+            max_attempts: Some(1),
+        };
+        let group: super::ConsumerGroup<serde_json::Value> =
+            super::ConsumerGroup::open(&path, Duration::from_secs(60), exhausts_immediately)
+                .await
+                .unwrap();
+        let id = group.enqueue(payload).await.unwrap();
+        let claim = group.claim().await;
+        if let Some(checkpoint) = checkpoint {
+            group.checkpoint(claim.id, claim.token, checkpoint).await.unwrap();
+        }
+        group.nack(claim.id, claim.token, Some("simulated failure".to_string())).await.unwrap();
+        id.to_string()
     }
 
     /// Every `EnqueueParams` field except `queue`/`payload`, defaulted to
@@ -1565,5 +1884,209 @@ mod tests {
             panic!("expected an error with no routes registered");
         };
         assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn list_dead_letters_reports_payload_checkpoint_and_failure_context() {
+        let dir = tempdir().unwrap();
+        let id = seed_a_dead_letter(
+            &dir,
+            "doomed",
+            json!({"task": "will fail"}),
+            Some(json!({"completed_steps": ["fetch"]})),
+        )
+        .await;
+
+        let server = server(&dir);
+        let listed = server
+            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+                super::ListDeadLettersParams { queue: "doomed".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_id, id);
+        assert_eq!(listed[0].payload, json!({"task": "will fail"}));
+        assert_eq!(listed[0].delivery_count, 1);
+        assert_eq!(listed[0].last_error.as_deref(), Some("simulated failure"));
+        assert_eq!(listed[0].checkpoint, Some(json!({"completed_steps": ["fetch"]})));
+        assert!(listed[0].triage.is_none());
+    }
+
+    #[tokio::test]
+    async fn triaging_as_transient_auto_reprocesses_into_the_live_queue() {
+        let dir = tempdir().unwrap();
+        let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
+        let server = server(&dir);
+
+        let result = server
+            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::TriageDeadLetterParams {
+                    queue: "doomed".to_string(),
+                    message_id: id.clone(),
+                    classification: super::TriageClassificationParam::Transient,
+                    reason: "looks like a rate limit".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(result.annotated);
+        assert!(result.reprocessed);
+
+        // Gone from the DLQ, and genuinely claimable again in the live
+        // queue - not just marked somehow.
+        let listed = server
+            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+                super::ListDeadLettersParams { queue: "doomed".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.is_empty());
+
+        let claimed = server
+            .claim(rmcp::handler::server::wrapper::Parameters(super::ClaimParams {
+                queue: "doomed".to_string(),
+                wait_ms: Some(500),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(claimed.available);
+        assert_eq!(claimed.message_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn triaging_as_permanent_holds_and_annotates_without_reprocessing() {
+        let dir = tempdir().unwrap();
+        let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
+        let server = server(&dir);
+
+        let result = server
+            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::TriageDeadLetterParams {
+                    queue: "doomed".to_string(),
+                    message_id: id.clone(),
+                    classification: super::TriageClassificationParam::Permanent,
+                    reason: "malformed input, will never succeed".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(result.annotated);
+        assert!(!result.reprocessed, "permanent must never auto-reprocess");
+
+        let listed = server
+            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+                super::ListDeadLettersParams { queue: "doomed".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(listed.len(), 1, "must still be held in the DLQ, not discarded");
+        let triage = listed[0].triage.as_ref().unwrap();
+        assert_eq!(triage.classification, "permanent");
+        assert_eq!(triage.reason, "malformed input, will never succeed");
+    }
+
+    #[tokio::test]
+    async fn triaging_an_unknown_id_is_not_annotated() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .triage_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::TriageDeadLetterParams {
+                    queue: "doomed".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    classification: super::TriageClassificationParam::Transient,
+                    reason: "no such entry".to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+
+        assert!(!result.annotated);
+        assert!(!result.reprocessed);
+    }
+
+    #[tokio::test]
+    async fn reprocess_dead_letter_works_directly_without_triage() {
+        let dir = tempdir().unwrap();
+        let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
+        let server = server(&dir);
+
+        let result = server
+            .reprocess_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::DeadLetterActionParams { queue: "doomed".to_string(), message_id: id },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(result.reprocessed);
+
+        let listed = server
+            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+                super::ListDeadLettersParams { queue: "doomed".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn purge_dead_letter_discards_it_for_good() {
+        let dir = tempdir().unwrap();
+        let id = seed_a_dead_letter(&dir, "doomed", json!("will fail"), None).await;
+        let server = server(&dir);
+
+        let result = server
+            .purge_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::DeadLetterActionParams { queue: "doomed".to_string(), message_id: id },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(result.purged);
+
+        let listed = server
+            .list_dead_letters(rmcp::handler::server::wrapper::Parameters(
+                super::ListDeadLettersParams { queue: "doomed".to_string() },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.is_empty());
+
+        // Purging is the one action nothing in this module auto-applies
+        // from a mere classification — confirmed here only by the fact
+        // that reaching this state required calling purge_dead_letter
+        // directly, not triage_dead_letter with any classification.
+    }
+
+    #[tokio::test]
+    async fn purging_an_unknown_id_is_a_false_not_an_error() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir);
+
+        let result = server
+            .purge_dead_letter(rmcp::handler::server::wrapper::Parameters(
+                super::DeadLetterActionParams {
+                    queue: "doomed".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                },
+            ))
+            .await
+            .unwrap()
+            .0;
+        assert!(!result.purged);
     }
 }
