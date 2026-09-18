@@ -9,15 +9,36 @@
 //! stdio isn't a listening socket, but it is a real protocol a real
 //! client can drive this process through.
 //!
-//! It still waits on the server's own run loop rather than exiting
+//! It still waits on the stdio server's own run loop rather than exiting
 //! immediately, same as the scaffold this replaces — `RunningService::waiting`
 //! resolves when the client disconnects (stdin closes) or the process is
 //! asked to shut down, which is the natural lifetime for a subprocess an
 //! agent runtime spawns and eventually tears down itself.
+//!
+//! # `feature/api-auth`: a second, authenticated transport
+//!
+//! No branch in `Plan.md` ever adds a network listener explicitly, but
+//! `feature/api-auth`'s whole point — a real trust boundary for API keys
+//! and JWTs to defend — needs one to exist. This branch adds it:
+//! [`serve_http`] stands up `rmcp`'s own streamable-HTTP transport
+//! alongside stdio, with [`http_auth::require_tenant`] guarding every
+//! request. Unlike stdio, this listener defaults to loopback-only
+//! (`QAAS_HTTP_ADDR`, `127.0.0.1:8080` unless overridden) — a real
+//! multi-tenant deployment has to opt into being reachable from beyond
+//! this host, not get it by default from running the binary. The stdio
+//! transport itself stays exactly as unauthenticated as it always was:
+//! it's a local subprocess connection, not a network boundary, and
+//! nothing about adding a second, network-facing transport changes what
+//! the first one already was.
 
+mod http_auth;
 mod mcp;
 
+use std::sync::Arc;
+
 use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
 /// Where queue WAL files live, overridable via `QAAS_DATA_DIR` — the
 /// default keeps a fresh checkout runnable with no configuration, the
@@ -25,9 +46,22 @@ use rmcp::ServiceExt;
 /// and any real deployment actually need.
 const DEFAULT_DATA_DIR: &str = "./data/queues";
 
+/// Where the streamable-HTTP MCP transport listens, overridable via
+/// `QAAS_HTTP_ADDR`. Loopback-only by default — see the module docs on
+/// why that's a deliberate default rather than `0.0.0.0`.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // `tracing_subscriber::fmt`'s default writer is stdout - fine for a
+    // process with no other use for that stream, but this one's stdio
+    // transport *is* that stream: any log line sharing it with JSON-RPC
+    // traffic corrupts the protocol for whichever client is on the other
+    // end. Found and fixed in this branch (`feature/api-auth`) while
+    // smoke-testing `create_api_key` over a real stdio connection for the
+    // first time - every earlier branch's stdio testing apparently never
+    // exercised a client strict enough to notice.
+    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let data_dir = std::env::var("QAAS_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
     if let Err(error) = tokio::fs::create_dir_all(&data_dir).await {
@@ -35,9 +69,24 @@ async fn main() {
         return;
     }
 
-    tracing::info!(%data_dir, "starting QaaS MCP server over stdio");
-    let server = mcp::QaasMcpServer::new(data_dir);
+    let server = match mcp::QaasMcpServer::new(data_dir).await {
+        Ok(server) => server,
+        Err(error) => {
+            tracing::error!(%error, "failed to open queue data / API-key store");
+            return;
+        }
+    };
 
+    let http_addr =
+        std::env::var("QAAS_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());
+    let http_server = server.clone();
+    tokio::spawn(async move {
+        if let Err(error) = serve_http(http_server, &http_addr).await {
+            tracing::error!(%error, %http_addr, "streamable-HTTP MCP server failed");
+        }
+    });
+
+    tracing::info!("starting QaaS MCP server over stdio");
     let running = match server.serve(rmcp::transport::stdio()).await {
         Ok(running) => running,
         Err(error) => {
@@ -50,4 +99,34 @@ async fn main() {
         Ok(reason) => tracing::info!(?reason, "MCP server stopped"),
         Err(error) => tracing::error!(%error, "MCP server task panicked"),
     }
+}
+
+/// Binds and serves `rmcp`'s streamable-HTTP MCP transport on `addr`,
+/// with [`http_auth::require_tenant`] wrapped around every request via
+/// an axum middleware layer — a request that doesn't resolve to a tenant
+/// never reaches `service`, and so never reaches a single MCP tool call.
+/// `LocalSessionManager` (an in-memory session store, `rmcp`'s own
+/// default) is enough here: this branch adds authentication, not
+/// clustering, so there's no reason yet for MCP session state to
+/// outlive this one process — see `qaas-core::raft`'s own docs for where
+/// actual cross-node state eventually belongs.
+///
+/// Runs until the listener itself fails; there's no separate shutdown
+/// signal in this branch, matching how the stdio transport's own
+/// lifetime is just "the process is still running."
+async fn serve_http(server: mcp::QaasMcpServer, addr: &str) -> std::io::Result<()> {
+    let auth_state = http_auth::AuthState::new(Arc::clone(&server.api_keys));
+    let service: StreamableHttpService<mcp::QaasMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn_with_state(auth_state, http_auth::require_tenant));
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "starting QaaS MCP server over streamable HTTP");
+    axum::serve(listener, router).await
 }
