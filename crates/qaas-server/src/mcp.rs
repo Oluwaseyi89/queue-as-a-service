@@ -208,6 +208,52 @@
 //! protocol this SDK doesn't hand us for free. A caller that wants
 //! near-real-time updates just calls it in a loop, passing back the
 //! highest `sequence` it's already seen each time.
+//!
+//! # Multi-tenant quotas (`feature/multi-tenant-quotas`)
+//!
+//! `feature/api-auth` made two tenants' queues fully isolated — never
+//! seeing or touching each other's messages — but said nothing about how
+//! much of the *shared* process either one gets to use. A noisy tenant,
+//! or a single runaway agent loop, could still open an unbounded number
+//! of queues, leave an unbounded number of messages pending across them,
+//! or hammer tool calls fast enough to starve every other tenant's
+//! actual work of CPU and lock time — isolation alone doesn't prevent
+//! any of that. This branch closes that gap with three independent,
+//! per-tenant ceilings, all opt-in (a tenant nobody has configured a
+//! quota for is never throttled) and all exempt for the trusted stdio
+//! connection, the same as every tenant-scoped check `feature/api-auth`
+//! already added:
+//!
+//! - `max_queues` — `enqueue`, `claim`, and every other tool that opens a
+//!   queue on first reference (see [`QueueRegistry::get`]) refuses to
+//!   open a tenant's next-over-the-limit queue. An already-open queue
+//!   never becomes invalid just because the ceiling was lowered since.
+//! - `max_pending_messages` — `enqueue` refuses a message that would
+//!   push a tenant's total unacknowledged count, summed across every
+//!   queue it has open, past the ceiling. Checked after dedup (a
+//!   collapsed enqueue creates no new pending message) but before the
+//!   per-queue token/cost admission check — the coarser, tenant-wide gate
+//!   comes first.
+//! - `requests_per_window` — every tool call, not just `enqueue`, spends
+//!   one request of the calling tenant's rate quota via a new
+//!   [`QaasMcpServer::authorize`] method that every `#[tool]`-annotated
+//!   method now calls instead of the bare [`tenant_from`] `feature/api-auth`
+//!   introduced. Backed by [`qaas_core::TenantQuota`] — the same
+//!   trailing-window algorithm [`qaas_core::AdmissionController`] already
+//!   ports from global-rate-limiter, just counting plain requests again
+//!   instead of tokens and dollars. See that module's own docs for why
+//!   it's a sibling primitive rather than a generalization of
+//!   `AdmissionController`.
+//!
+//! Two new tools: `configure_tenant_quota` sets all three ceilings for a
+//! named tenant, restricted to the trusted stdio connection the same way
+//! `create_api_key` is — an operator action, not something a tenant
+//! credential should be able to do to itself or anyone else.
+//! `tenant_quota_status` is the self-service counterpart: any
+//! HTTP-authenticated tenant can call it with no arguments to see its own
+//! configuration and live usage (queues open, pending messages, requests
+//! this window), while the stdio connection must name which tenant to
+//! report on, since it has no tenant of its own to default to.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -216,8 +262,8 @@ use std::time::Duration;
 
 use qaas_core::{
     AdmissionConfig, AdmissionController, AdmissionDecision, ApiKeyStore, ConsumerGroup, Embedding,
-    EmbeddingIndex, LeaseToken, PartialResultsPoll, RetryPolicy, TenantId, TriageClassification,
-    TriageVerdict,
+    EmbeddingIndex, LeaseToken, PartialResultsPoll, QuotaConfig, QuotaDecision, RetryPolicy,
+    TenantId, TenantQuota, TriageClassification, TriageVerdict,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::service::RequestContext;
@@ -327,16 +373,20 @@ fn tenant_from(ctx: &RequestContext<RoleServer>) -> Option<TenantId> {
     ctx.extensions.get::<http::request::Parts>()?.extensions.get::<TenantId>().cloned()
 }
 
-/// Maps an [`AdmissionDecision::Denied`] onto the MCP error shape.
+/// Maps an [`AdmissionDecision::Denied`] or a [`QuotaDecision::Denied`]
+/// onto the MCP error shape — both share the exact same `reason` /
+/// `retry_after` structure by design (see [`quota`](qaas_core::quota)'s
+/// own docs on why it's a sibling of
+/// [`admission`](qaas_core::admission) rather than a rewrite), so one
+/// mapper serves both call sites instead of two near-duplicates.
 /// [`ErrorCode::INVALID_REQUEST`](rmcp::model::ErrorCode) rather than
 /// `INVALID_PARAMS`: the request itself is well-formed, just not
 /// currently admissible — the same distinction a real HTTP 429 draws
 /// from a 400. `retry_after` travels in the structured `data` field
-/// (seconds, or absent if retrying can never help — see
-/// [`AdmissionDecision::Denied`]'s own docs) so a calling agent can act
-/// on it programmatically instead of having to parse it back out of
-/// `reason`'s prose.
-fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> ErrorData {
+/// (seconds, or absent if retrying can never help) so a calling agent
+/// can act on it programmatically instead of having to parse it back out
+/// of `reason`'s prose.
+fn throttled_to_mcp(reason: &str, retry_after: Option<Duration>) -> ErrorData {
     ErrorData::invalid_request(
         reason.to_string(),
         Some(serde_json::json!({ "retry_after_seconds": retry_after.map(|d| d.as_secs_f64()) })),
@@ -345,8 +395,8 @@ fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> Error
 
 /// Lazily opens and holds one [`ConsumerGroup`], one
 /// [`AdmissionController`], and one dedup [`EmbeddingIndex`] per
-/// *tenant-scoped* queue name, plus one routing [`EmbeddingIndex`] per
-/// tenant.
+/// *tenant-scoped* queue name, plus one routing [`EmbeddingIndex`] and
+/// one [`TenantQuota`] per tenant.
 ///
 /// Every lookup here takes `tenant: Option<&TenantId>` — `None` for a
 /// call that came in over the trusted local stdio connection (see this
@@ -358,9 +408,15 @@ fn admission_denied_to_mcp(reason: &str, retry_after: Option<Duration>) -> Error
 /// literally named `"orders"` — this is the actual trust boundary
 /// `feature/api-auth` exists to build, not just bookkeeping: isolation
 /// is total and unconditional, not a permission a tenant could be
-/// granted or denied. What a tenant *can't* yet do anything about is how
-/// much of a shared budget it uses — that's `feature/multi-tenant-quotas`,
-/// a deliberately separate, later branch.
+/// granted or denied. `feature/multi-tenant-quotas` is what finally gives
+/// an operator a knob for the question isolation alone never answered —
+/// how much of the *shared* process a given tenant gets to use: `Self::get`
+/// refuses to open a tenant's `max_queues`-plus-first queue, `enqueue`
+/// (see [`QaasMcpServer::enqueue_impl`]) refuses one that would push a
+/// tenant's total pending messages past `max_pending_messages`, and
+/// [`QaasMcpServer::authorize`] refuses any tool call once a tenant is
+/// over its `requests_per_window`. Stdio is exempt from all three, same
+/// as it's exempt from tenant scoping in the first place.
 ///
 /// A `ConsumerGroup` owns a WAL file and does its own internal locking
 /// once opened, so this registry's own lock is only ever held for the
@@ -379,6 +435,15 @@ struct QueueRegistry {
     admission: Mutex<HashMap<String, Arc<AdmissionController>>>,
     dedup: Mutex<HashMap<String, Arc<EmbeddingIndex<qaas_types::MessageId>>>>,
     routes: Mutex<HashMap<String, Arc<EmbeddingIndex<String>>>>,
+    /// One [`TenantQuota`] per tenant, never per queue — `max_queues` and
+    /// `max_pending_messages` are ceilings on a tenant's *total*
+    /// footprint across every queue it has, not a per-queue limit, and
+    /// `requests_per_window` throttles the tenant's tool calls generally,
+    /// not calls against any one queue. Keyed by plain tenant id (there's
+    /// no `None` entry — `authorize` never consults this map for the
+    /// trusted stdio connection at all, rather than storing an always-
+    /// unlimited entry for it that nothing would ever meaningfully use).
+    tenant_quotas: Mutex<HashMap<String, Arc<TenantQuota>>>,
 }
 
 impl QueueRegistry {
@@ -389,6 +454,7 @@ impl QueueRegistry {
             admission: Mutex::new(HashMap::new()),
             dedup: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
+            tenant_quotas: Mutex::new(HashMap::new()),
         }
     }
 
@@ -414,6 +480,14 @@ impl QueueRegistry {
         tenant.map_or_else(String::new, |tenant| tenant.as_str().to_string())
     }
 
+    /// The prefix every `scope_key` belonging to `tenant` starts with —
+    /// used to count or sum across all of a tenant's queues at once
+    /// (`max_queues`, `max_pending_messages`), rather than one queue at a
+    /// time the way `scope_key` itself addresses a single entry.
+    fn tenant_prefix(tenant: &TenantId) -> String {
+        format!("{}\0", tenant.as_str())
+    }
+
     /// Returns `tenant`'s queue named `name`, opening it (creating its
     /// WAL file under `data_dir` — under a `tenant`-named subdirectory
     /// when `tenant` is `Some`, so two tenants' `"orders"` queues are
@@ -431,6 +505,27 @@ impl QueueRegistry {
         let mut groups = self.groups.lock().await;
         if let Some(group) = groups.get(&key) {
             return Ok(Arc::clone(group));
+        }
+
+        // Only a genuinely *new* queue is checked against max_queues - an
+        // already-open one never becomes invalid just because a ceiling
+        // was lowered since, the same "already-admitted usage isn't
+        // retroactively undone" stance every other ceiling in this file
+        // takes (see AdmissionController::set_config's own docs).
+        if let Some(tenant) = tenant
+            && let Some(max_queues) = self.quota(tenant).await.config().await.max_queues
+        {
+            let open = Self::count_matching(&groups, tenant);
+            if open >= max_queues {
+                return Err(ErrorData::invalid_request(
+                    format!(
+                        "tenant {:?} already has {open} queues open, at its {max_queues}-queue \
+                         limit - configure_tenant_quota can raise it",
+                        tenant.as_str()
+                    ),
+                    None,
+                ));
+            }
         }
 
         let dir = match tenant {
@@ -512,6 +607,80 @@ impl QueueRegistry {
         let routes = Arc::new(EmbeddingIndex::new(None));
         registries.insert(key, Arc::clone(&routes));
         routes
+    }
+
+    /// Returns `tenant`'s quota, creating one with [`QuotaConfig::UNLIMITED`]
+    /// on first reference — a tenant no one has ever called
+    /// `configure_tenant_quota` on is never throttled, not throttled by
+    /// some undocumented default. No `Option<&TenantId>` parameter here,
+    /// unlike every other accessor: the trusted stdio connection never
+    /// has a quota to look up in the first place, so every call site
+    /// already knows it only has a `&TenantId` to offer.
+    async fn quota(&self, tenant: &TenantId) -> Arc<TenantQuota> {
+        let key = tenant.as_str().to_string();
+
+        let mut quotas = self.tenant_quotas.lock().await;
+        if let Some(quota) = quotas.get(&key) {
+            return Arc::clone(quota);
+        }
+
+        let quota = Arc::new(TenantQuota::new(QuotaConfig::UNLIMITED));
+        quotas.insert(key, Arc::clone(&quota));
+        quota
+    }
+
+    /// How many of `groups`' keys belong to `tenant` — shared by
+    /// [`Self::get`] (checking `max_queues` while already holding the
+    /// lock `groups` is a guard for) and [`Self::tenant_queue_count`]
+    /// (reporting the same number for `tenant_quota_status`, without
+    /// already holding it).
+    fn count_matching(
+        groups: &HashMap<String, Arc<ConsumerGroup<serde_json::Value>>>,
+        tenant: &TenantId,
+    ) -> usize {
+        let prefix = Self::tenant_prefix(tenant);
+        groups.keys().filter(|key| key.starts_with(&prefix)).count()
+    }
+
+    /// How many queues `tenant` currently has open — what `max_queues`
+    /// is actually checked against, and what `tenant_quota_status`
+    /// reports back.
+    async fn tenant_queue_count(&self, tenant: &TenantId) -> usize {
+        let groups = self.groups.lock().await;
+        Self::count_matching(&groups, tenant)
+    }
+
+    /// Total unacknowledged messages across every queue `tenant`
+    /// currently has open — what `max_pending_messages` is actually
+    /// checked against. Only counts queues this process has already
+    /// opened in [`Self::get`]; a queue that exists on disk but hasn't
+    /// been referenced yet contributes nothing, the same "lazily opens
+    /// and holds" stance the rest of this registry already takes (see
+    /// its own struct docs) - consistent with `max_queues` counting only
+    /// entries in this same map, not a filesystem scan.
+    async fn tenant_pending_total(&self, tenant: &TenantId) -> u64 {
+        let prefix = Self::tenant_prefix(tenant);
+        // Snapshot the matching Arcs and drop the registry's own lock
+        // before awaiting each ConsumerGroup's own `len()` - `len()`
+        // takes that group's *own* internal lock, and holding two locks
+        // across an await for no reason is worth avoiding on principle
+        // even though nothing else in this file ever acquires them in
+        // the reverse order.
+        let matching: Vec<_> = {
+            let groups = self.groups.lock().await;
+            groups
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, group)| Arc::clone(group))
+                .collect()
+        };
+
+        let mut total: u64 = 0;
+        for group in matching {
+            let len = u64::try_from(group.len().await).unwrap_or(u64::MAX);
+            total = total.saturating_add(len);
+        }
+        total
     }
 }
 
@@ -1039,6 +1208,80 @@ struct RevokeApiKeyResult {
     revoked: bool,
 }
 
+/// Arguments for the `configure_tenant_quota` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ConfigureTenantQuotaParams {
+    /// Which tenant this quota applies to.
+    tenant_id: String,
+    /// Maximum queues this tenant may have open at once. Omit to leave
+    /// unlimited.
+    max_queues: Option<usize>,
+    /// Maximum total unacknowledged messages this tenant may have
+    /// outstanding across all of its queues at once. Omit to leave
+    /// unlimited.
+    max_pending_messages: Option<u64>,
+    /// Maximum MCP tool calls this tenant may make within
+    /// `window_seconds`. Omit to leave unlimited.
+    requests_per_window: Option<u64>,
+    /// The rolling window `requests_per_window` is measured over, in
+    /// seconds. Defaults to 60 if omitted; irrelevant while
+    /// `requests_per_window` is omitted too.
+    window_seconds: Option<u64>,
+}
+
+/// Result of the `configure_tenant_quota` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct ConfigureTenantQuotaResult {
+    /// Echoed back for confirmation.
+    tenant_id: String,
+    /// The configuration now in effect, immediately - see
+    /// `TenantQuota::set_config`'s own docs on what "immediately" does
+    /// and doesn't retroactively change.
+    max_queues: Option<usize>,
+    max_pending_messages: Option<u64>,
+    requests_per_window: Option<u64>,
+    window_seconds: u64,
+}
+
+/// Arguments for the `tenant_quota_status` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TenantQuotaStatusParams {
+    /// Which tenant to report on. Required for a caller on the trusted
+    /// stdio connection - the operator can ask about any tenant. Ignored
+    /// for an HTTP-authenticated caller, who always gets their own
+    /// status back regardless of what (if anything) this names - no
+    /// tenant can query another's usage this way.
+    tenant_id: Option<String>,
+}
+
+/// Result of the `tenant_quota_status` tool.
+#[derive(Debug, Serialize, JsonSchema)]
+struct TenantQuotaStatusResult {
+    /// Which tenant this status is for.
+    tenant_id: String,
+    /// Configured queue-count ceiling, `null` if unlimited.
+    max_queues: Option<usize>,
+    /// How many queues this tenant currently has open.
+    queues_open: usize,
+    /// Configured pending-message ceiling, `null` if unlimited.
+    max_pending_messages: Option<u64>,
+    /// Total unacknowledged messages across this tenant's queues right
+    /// now.
+    pending_messages: u64,
+    /// Configured request-rate ceiling, `null` if unlimited.
+    requests_per_window: Option<u64>,
+    /// How many tool calls this tenant has made within the current
+    /// window. Includes this very call when an HTTP-authenticated tenant
+    /// checks its own status (authorized through the exact same path as
+    /// every other tool); doesn't, when the trusted stdio connection
+    /// checks a tenant's status on its behalf, since that request never
+    /// authorized *as* the tenant it's asking about.
+    requests_in_window: u64,
+    /// The rolling window `requests_per_window` (and
+    /// `requests_in_window`) are measured over.
+    window_seconds: u64,
+}
+
 /// The MCP server itself. Cheap to clone — the only state is two
 /// `Arc`'d pieces, [`QueueRegistry`] and [`ApiKeyStore`] — which `rmcp`
 /// relies on internally when handling more than one tool call
@@ -1074,6 +1317,47 @@ impl QaasMcpServer {
         Ok(Self { registry: Arc::new(QueueRegistry::new(data_dir)), api_keys: Arc::new(api_keys) })
     }
 
+    /// The single entry point every tool method uses instead of calling
+    /// [`tenant_from`] directly: resolves the caller's tenant *and*
+    /// spends one request of its rate quota, in one place, so there's no
+    /// way for a new tool to accidentally skip the check the way sixteen
+    /// separate copies of it invite. Stdio (`None`) is exempt entirely —
+    /// see the module docs on why that connection stays trusted and
+    /// unthrottled — matching every other tenant-scoped check in this
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::INVALID_REQUEST`](rmcp::model::ErrorCode) if
+    /// the resolved tenant is currently over its configured
+    /// `requests_per_window` — see [`quota::QuotaDecision::Denied`](qaas_core::quota::QuotaDecision::Denied).
+    async fn authorize(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<Option<TenantId>, ErrorData> {
+        self.authorize_impl(tenant_from(ctx)).await
+    }
+
+    /// The actual `authorize` logic, taking `tenant` directly rather than
+    /// a [`RequestContext`] — see [`Self::enqueue_impl`]'s docs on why
+    /// every dispatch-layer method in this file has a `_impl` sibling
+    /// tests can call without a real MCP connection to construct a
+    /// context from.
+    async fn authorize_impl(
+        &self,
+        tenant: Option<TenantId>,
+    ) -> Result<Option<TenantId>, ErrorData> {
+        if let Some(tenant) = &tenant {
+            match self.registry.quota(tenant).await.try_acquire().await {
+                QuotaDecision::Allowed { .. } => {}
+                QuotaDecision::Denied { reason, retry_after } => {
+                    return Err(throttled_to_mcp(&reason, retry_after));
+                }
+            }
+        }
+        Ok(tenant)
+    }
+
     /// Durably enqueues a message onto a named queue, creating the queue
     /// on first use.
     #[tool(
@@ -1084,7 +1368,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<EnqueueParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<EnqueueResult>, ErrorData> {
-        self.enqueue_impl(tenant_from(&ctx), params).await
+        self.enqueue_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `enqueue` logic, taking `tenant` directly rather than a
@@ -1142,6 +1426,30 @@ impl QaasMcpServer {
             }));
         }
 
+        // Same "dedup runs first" ordering as admission below: a
+        // collapsed enqueue creates no new pending message, so it
+        // shouldn't be blocked by a tenant that's already at its pending-
+        // message ceiling either. Checked before the per-queue
+        // token/cost budget, not after - this is the coarser, tenant-wide
+        // gate `feature/multi-tenant-quotas` adds on top of a budget
+        // that only ever knew about one queue at a time.
+        if let Some(tenant) = &tenant
+            && let Some(max_pending) =
+                self.registry.quota(tenant).await.config().await.max_pending_messages
+        {
+            let current = self.registry.tenant_pending_total(tenant).await;
+            if current >= max_pending {
+                return Err(ErrorData::invalid_request(
+                    format!(
+                        "tenant {:?} already has {current} pending messages across its queues, \
+                         at its {max_pending}-message limit - configure_tenant_quota can raise it",
+                        tenant.as_str()
+                    ),
+                    None,
+                ));
+            }
+        }
+
         let (tokens_remaining, cost_remaining) = match admission
             .try_admit(params.estimated_tokens.unwrap_or(0), params.estimated_cost.unwrap_or(0.0))
             .await
@@ -1150,7 +1458,7 @@ impl QaasMcpServer {
                 (tokens_remaining, cost_remaining)
             }
             AdmissionDecision::Denied { reason, retry_after } => {
-                return Err(admission_denied_to_mcp(&reason, retry_after));
+                return Err(throttled_to_mcp(&reason, retry_after));
             }
         };
 
@@ -1226,7 +1534,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<ClaimParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ClaimResult>, ErrorData> {
-        self.claim_impl(tenant_from(&ctx), params).await
+        self.claim_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `claim` logic — see [`Self::enqueue_impl`]'s docs on
@@ -1290,7 +1598,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<AckParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<AckResult>, ErrorData> {
-        self.ack_impl(tenant_from(&ctx), params).await
+        self.ack_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `ack` logic — see [`Self::enqueue_impl`]'s docs.
@@ -1328,7 +1636,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<NackParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<NackResult>, ErrorData> {
-        self.nack_impl(tenant_from(&ctx), params).await
+        self.nack_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `nack` logic — see [`Self::enqueue_impl`]'s docs.
@@ -1362,7 +1670,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<CheckpointParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<CheckpointResult>, ErrorData> {
-        self.checkpoint_impl(tenant_from(&ctx), params).await
+        self.checkpoint_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `checkpoint` logic — see [`Self::enqueue_impl`]'s docs.
@@ -1393,7 +1701,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<PublishPartialResultParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<PublishPartialResultResult>, ErrorData> {
-        self.publish_partial_result_impl(tenant_from(&ctx), params).await
+        self.publish_partial_result_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `publish_partial_result` logic — see
@@ -1432,7 +1740,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<StreamPartialResultsParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<StreamPartialResultsResult>, ErrorData> {
-        self.stream_partial_results_impl(tenant_from(&ctx), params).await
+        self.stream_partial_results_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `stream_partial_results` logic — see
@@ -1487,7 +1795,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<ConfigureAdmissionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigureAdmissionResult>, ErrorData> {
-        self.configure_admission_impl(tenant_from(&ctx), params).await
+        self.configure_admission_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `configure_admission` logic — see
@@ -1522,7 +1830,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<AdmissionStatusParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<AdmissionStatusResult>, ErrorData> {
-        self.admission_status_impl(tenant_from(&ctx), params).await
+        self.admission_status_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `admission_status` logic — see
@@ -1563,7 +1871,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<ConfigureRouteParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ConfigureRouteResult>, ErrorData> {
-        self.configure_route_impl(tenant_from(&ctx), params).await
+        self.configure_route_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `configure_route` logic — see
@@ -1598,7 +1906,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<ListDeadLettersParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<Vec<DeadLetterSummary>>, ErrorData> {
-        self.list_dead_letters_impl(tenant_from(&ctx), params).await
+        self.list_dead_letters_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `list_dead_letters` logic — see
@@ -1647,7 +1955,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<TriageDeadLetterParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<TriageDeadLetterResult>, ErrorData> {
-        self.triage_dead_letter_impl(tenant_from(&ctx), params).await
+        self.triage_dead_letter_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `triage_dead_letter` logic — see
@@ -1696,7 +2004,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<DeadLetterActionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<ReprocessDeadLetterResult>, ErrorData> {
-        self.reprocess_dead_letter_impl(tenant_from(&ctx), params).await
+        self.reprocess_dead_letter_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `reprocess_dead_letter` logic — see
@@ -1725,7 +2033,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<DeadLetterActionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<PurgeDeadLetterResult>, ErrorData> {
-        self.purge_dead_letter_impl(tenant_from(&ctx), params).await
+        self.purge_dead_letter_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `purge_dead_letter` logic — see
@@ -1756,7 +2064,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<CreateApiKeyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<CreateApiKeyResult>, ErrorData> {
-        self.create_api_key_impl(tenant_from(&ctx), params).await
+        self.create_api_key_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `create_api_key` logic — see [`Self::enqueue_impl`]'s
@@ -1798,7 +2106,7 @@ impl QaasMcpServer {
         Parameters(params): Parameters<RevokeApiKeyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<RevokeApiKeyResult>, ErrorData> {
-        self.revoke_api_key_impl(tenant_from(&ctx), params).await
+        self.revoke_api_key_impl(self.authorize(&ctx).await?, params).await
     }
 
     /// The actual `revoke_api_key` logic — see
@@ -1817,6 +2125,117 @@ impl QaasMcpServer {
         let revoked =
             self.api_keys.revoke(&params.api_key).await.map_err(|error| io_error_to_mcp(&error))?;
         Ok(Json(RevokeApiKeyResult { revoked }))
+    }
+
+    /// Sets a tenant's queue-count, pending-message, and request-rate
+    /// quotas. Restricted to the trusted local stdio connection — same
+    /// least-privilege reasoning as `create_api_key`: this configures
+    /// limits for *other* tenants, an operator action a tenant credential
+    /// itself has no business taking, for itself or anyone else.
+    #[tool(
+        description = "Set a tenant's resource quotas: max_queues (how many queues it may have \
+                        open at once), max_pending_messages (total unacknowledged messages across \
+                        all its queues), and requests_per_window (MCP tool calls per \
+                        window_seconds, default 60). Omitting a field leaves it unlimited. Takes \
+                        effect immediately, including for usage already counted. Only available \
+                        over the trusted local stdio connection."
+    )]
+    async fn configure_tenant_quota(
+        &self,
+        Parameters(params): Parameters<ConfigureTenantQuotaParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<ConfigureTenantQuotaResult>, ErrorData> {
+        self.configure_tenant_quota_impl(self.authorize(&ctx).await?, params).await
+    }
+
+    /// The actual `configure_tenant_quota` logic — see
+    /// [`Self::create_api_key_impl`]'s docs on why this takes
+    /// `caller_tenant` directly rather than a `RequestContext`.
+    async fn configure_tenant_quota_impl(
+        &self,
+        caller_tenant: Option<TenantId>,
+        params: ConfigureTenantQuotaParams,
+    ) -> Result<Json<ConfigureTenantQuotaResult>, ErrorData> {
+        if caller_tenant.is_some() {
+            return Err(ErrorData::invalid_request(
+                "configure_tenant_quota is only available over the trusted local stdio connection",
+                None,
+            ));
+        }
+        let tenant = TenantId::new(params.tenant_id)
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+
+        let window = Duration::from_secs(params.window_seconds.unwrap_or(60));
+        let config = QuotaConfig {
+            max_queues: params.max_queues,
+            max_pending_messages: params.max_pending_messages,
+            requests_per_window: params.requests_per_window,
+            window,
+        };
+        self.registry.quota(&tenant).await.set_config(config).await;
+
+        Ok(Json(ConfigureTenantQuotaResult {
+            tenant_id: tenant.as_str().to_string(),
+            max_queues: config.max_queues,
+            max_pending_messages: config.max_pending_messages,
+            requests_per_window: config.requests_per_window,
+            window_seconds: window.as_secs(),
+        }))
+    }
+
+    /// Reports a tenant's current quota configuration and live usage.
+    #[tool(description = "Report a tenant's current resource-quota configuration and live usage: \
+                        how many queues it has open, how many messages are pending across them, \
+                        and how many tool calls it's made within the current rate-limit window. \
+                        An HTTP-authenticated caller always gets its own status regardless of \
+                        tenant_id; the trusted stdio connection must pass tenant_id to name which \
+                        tenant to report on.")]
+    async fn tenant_quota_status(
+        &self,
+        Parameters(params): Parameters<TenantQuotaStatusParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Json<TenantQuotaStatusResult>, ErrorData> {
+        let caller_tenant = self.authorize(&ctx).await?;
+        self.tenant_quota_status_impl(caller_tenant, params).await
+    }
+
+    /// The actual `tenant_quota_status` logic — see
+    /// [`Self::enqueue_impl`]'s docs on why this is split out.
+    async fn tenant_quota_status_impl(
+        &self,
+        caller_tenant: Option<TenantId>,
+        params: TenantQuotaStatusParams,
+    ) -> Result<Json<TenantQuotaStatusResult>, ErrorData> {
+        let tenant = if let Some(tenant) = caller_tenant {
+            tenant
+        } else {
+            let Some(tenant_id) = params.tenant_id else {
+                return Err(ErrorData::invalid_params(
+                    "tenant_id is required when calling tenant_quota_status over the trusted \
+                     stdio connection",
+                    None,
+                ));
+            };
+            TenantId::new(tenant_id)
+                .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?
+        };
+
+        let quota = self.registry.quota(&tenant).await;
+        let config = quota.config().await;
+        let requests_in_window = quota.requests_in_window().await;
+        let queues_open = self.registry.tenant_queue_count(&tenant).await;
+        let pending_messages = self.registry.tenant_pending_total(&tenant).await;
+
+        Ok(Json(TenantQuotaStatusResult {
+            tenant_id: tenant.as_str().to_string(),
+            max_queues: config.max_queues,
+            queues_open,
+            max_pending_messages: config.max_pending_messages,
+            pending_messages,
+            requests_per_window: config.requests_per_window,
+            requests_in_window,
+            window_seconds: config.window.as_secs(),
+        }))
     }
 }
 
@@ -1845,7 +2264,10 @@ impl QaasMcpServer {
                     publish_partial_result after each incremental step (e.g. each token from a \
                     streaming LLM call) without resolving the message; another caller watches \
                     with stream_partial_results, passing after_sequence to only get what's new \
-                    and calling it again in a loop for near-real-time updates."
+                    and calling it again in a loop for near-real-time updates. If you're being \
+                    denied with a message about queue, pending-message, or request-rate limits, \
+                    call tenant_quota_status (no arguments needed) to see your current \
+                    configuration and usage before retrying."
 )]
 impl ServerHandler for QaasMcpServer {}
 
@@ -3190,5 +3612,288 @@ mod tests {
 
         let resolved = server.api_keys.authenticate(&minted.api_key).await;
         assert_eq!(resolved, None);
+    }
+
+    /// Every `ConfigureTenantQuotaParams` field except `tenant_id`,
+    /// defaulted to "unlimited" - same reasoning as `enqueue_params`.
+    fn quota_params(tenant_id: &str) -> super::ConfigureTenantQuotaParams {
+        super::ConfigureTenantQuotaParams {
+            tenant_id: tenant_id.to_string(),
+            max_queues: None,
+            max_pending_messages: None,
+            requests_per_window: None,
+            window_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_refused_a_queue_beyond_its_configured_limit() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    max_queues: Some(1),
+                    ..quota_params("tenant-a")
+                },
+            )
+            .await
+            .unwrap();
+
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("first", json!("a")))
+            .await
+            .unwrap();
+
+        let second =
+            server.enqueue_impl(Some(tenant.clone()), enqueue_params("second", json!("b"))).await;
+        assert!(second.is_err(), "a second distinct queue should exceed the 1-queue limit");
+
+        // The already-open first queue is unaffected - the limit only
+        // ever gates *opening a new* queue.
+        let again = server.enqueue_impl(Some(tenant), enqueue_params("first", json!("c"))).await;
+        assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_refused_a_message_beyond_its_pending_limit() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    max_pending_messages: Some(1),
+                    ..quota_params("tenant-a")
+                },
+            )
+            .await
+            .unwrap();
+
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("first")))
+            .await
+            .unwrap();
+
+        let denied = server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("second")))
+            .await;
+        assert!(denied.is_err(), "a second pending message should exceed the 1-message limit");
+
+        // Acking the first message frees a slot for another.
+        let claimed = server
+            .claim_impl(
+                Some(tenant.clone()),
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(50) },
+            )
+            .await
+            .unwrap()
+            .0;
+        server
+            .ack_impl(
+                Some(tenant.clone()),
+                super::AckParams {
+                    queue: "orders".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let after_ack =
+            server.enqueue_impl(Some(tenant), enqueue_params("orders", json!("third"))).await;
+        assert!(after_ack.is_ok(), "acking the first message should free a pending slot");
+    }
+
+    #[tokio::test]
+    async fn a_deduplicated_enqueue_never_counts_against_the_pending_limit() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    max_pending_messages: Some(1),
+                    ..quota_params("tenant-a")
+                },
+            )
+            .await
+            .unwrap();
+
+        let embedding = vec![1.0, 0.0, 0.0];
+        server
+            .enqueue_impl(
+                Some(tenant.clone()),
+                super::EnqueueParams {
+                    embedding: Some(embedding.clone()),
+                    ..enqueue_params("orders", json!("first"))
+                },
+            )
+            .await
+            .unwrap();
+
+        // A near-duplicate of the first task collapses into it rather
+        // than creating a new pending message, so it must not be refused
+        // by a pending limit already fully used by the original.
+        let collapsed = server
+            .enqueue_impl(
+                Some(tenant),
+                super::EnqueueParams {
+                    embedding: Some(embedding),
+                    ..enqueue_params("orders", json!("near-duplicate"))
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(collapsed.deduplicated);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_is_throttled_once_its_request_rate_limit_is_exhausted() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    requests_per_window: Some(1),
+                    window_seconds: Some(60),
+                    ..quota_params("tenant-a")
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(server.authorize_impl(Some(tenant.clone())).await.is_ok());
+        let denied = server.authorize_impl(Some(tenant)).await;
+        assert!(denied.is_err(), "a second request within the window should be throttled");
+    }
+
+    #[tokio::test]
+    async fn the_trusted_stdio_connection_is_never_rate_limited() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        // No quota was ever configured for `None` - there's nothing to
+        // configure it *as* - so every call succeeds regardless of how
+        // many times it's made.
+        for _ in 0..5 {
+            assert_eq!(server.authorize_impl(None).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_tenant_quota_is_rejected_for_a_caller_already_authenticated_over_http() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let already_authenticated = TenantId::new("tenant-a").unwrap();
+
+        let result = server
+            .configure_tenant_quota_impl(Some(already_authenticated), quota_params("tenant-b"))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_status_requires_a_tenant_id_over_stdio() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let result = server
+            .tenant_quota_status_impl(None, super::TenantQuotaStatusParams { tenant_id: None })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_status_reports_live_usage_for_the_calling_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    max_queues: Some(5),
+                    max_pending_messages: Some(100),
+                    requests_per_window: Some(50),
+                    window_seconds: Some(30),
+                    ..quota_params("tenant-a")
+                },
+            )
+            .await
+            .unwrap();
+
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("a")))
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("b")))
+            .await
+            .unwrap();
+
+        let status = server
+            .tenant_quota_status_impl(
+                Some(tenant.clone()),
+                super::TenantQuotaStatusParams { tenant_id: None },
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(status.tenant_id, "tenant-a");
+        assert_eq!(status.max_queues, Some(5));
+        assert_eq!(status.queues_open, 1);
+        assert_eq!(status.max_pending_messages, Some(100));
+        assert_eq!(status.pending_messages, 2);
+        assert_eq!(status.requests_per_window, Some(50));
+        assert_eq!(status.window_seconds, 30);
+
+        // A second tenant, entirely unconfigured, is unaffected.
+        let other_status = server
+            .tenant_quota_status_impl(
+                Some(TenantId::new("tenant-b").unwrap()),
+                super::TenantQuotaStatusParams { tenant_id: None },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(other_status.max_queues, None);
+        assert_eq!(other_status.queues_open, 0);
+        assert_eq!(other_status.pending_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_status_over_stdio_reports_on_the_named_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server.enqueue_impl(Some(tenant), enqueue_params("orders", json!("a"))).await.unwrap();
+
+        let status = server
+            .tenant_quota_status_impl(
+                None,
+                super::TenantQuotaStatusParams { tenant_id: Some("tenant-a".to_string()) },
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.tenant_id, "tenant-a");
+        assert_eq!(status.queues_open, 1);
+        assert_eq!(status.pending_messages, 1);
     }
 }
