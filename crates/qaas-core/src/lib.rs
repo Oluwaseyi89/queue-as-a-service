@@ -131,6 +131,23 @@
 //! credential `feature/api-auth` supports, lives in `qaas-server`
 //! instead: it needs real cryptography and is fundamentally about an
 //! HTTP header, neither of which belongs in a crate with no networking.
+//!
+//! `feature/multi-tenant-quotas` closes out Phase 5: [`quota::TenantQuota`]
+//! is [`admission::AdmissionController`]'s sibling, not a rewrite of it —
+//! the same trailing-window algorithm, but back to counting plain
+//! requests rather than tokens and dollars, because a runaway agent loop
+//! hammering tool calls is a request-count problem regardless of what
+//! any one of those calls would have cost. [`quota::QuotaConfig`] also
+//! carries `max_queues` and `max_pending_messages`, ceilings this module
+//! only stores rather than enforces — see its own docs for why comparing
+//! either against a live count has to happen at `qaas-server`'s registry
+//! instead.
+//!
+//! [`auth::TenantId`] itself doesn't change from `feature/api-auth`
+//! (isolation was already total and unconditional, not a permission);
+//! this branch is what finally gives an operator a knob for the question
+//! isolation alone never answered - how much of the *shared* process a
+//! given tenant gets to use.
 
 pub mod admission;
 pub mod auth;
@@ -138,6 +155,7 @@ pub mod circuit_breaker;
 pub mod consumer_group;
 pub mod dead_letter;
 pub mod queue;
+pub mod quota;
 pub mod raft;
 pub mod retry;
 pub mod semantic;
@@ -152,6 +170,7 @@ pub use circuit_breaker::{
 pub use consumer_group::{Claim, ConsumerGroup, LeaseToken, PartialResultsPoll, StreamChunk};
 pub use dead_letter::{DeadLetter, DeadLetterQueue, TriageClassification, TriageVerdict};
 pub use queue::{FifoQueue, PersistentFifoQueue, PersistentPriorityQueue, Priority, PriorityQueue};
+pub use quota::{QuotaConfig, QuotaDecision, TenantQuota};
 pub use retry::RetryPolicy;
 pub use semantic::{Embedding, EmbeddingIndex, InvalidEmbedding};
 pub use wal::Wal;
