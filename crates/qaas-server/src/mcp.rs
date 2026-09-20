@@ -306,6 +306,34 @@
 //! HTTP transport — see that module's docs for why: this data is
 //! inherently cross-tenant and operator-facing, not something a single
 //! tenant's API key should unlock.
+//!
+//! # Structured audit logging (`feature/structured-audit-logging`)
+//!
+//! [`AuditEvent`] is this branch's own answer to the "generic primitive
+//! in `qaas-core`, real event shape where the domain knowledge lives"
+//! split every earlier `qaas-core` primitive already follows (see
+//! [`qaas_core::audit`]'s own docs for the worker-pool/non-blocking
+//! design this wraps): one variant per audited verb — `Plan.md`'s line
+//! names `enqueue`/`ack`/`nack` specifically, not every tool this module
+//! exposes, so that's exactly what's logged, nothing broader. Every call
+//! that reaches real business logic is logged, success or denial alike
+//! (a quota or admission denial is itself a compliance-relevant fact —
+//! "who tried and was refused," not just "who succeeded"); a call
+//! rejected for being malformed before it ever touches a queue, tenant,
+//! or budget (a bad embedding, an empty idempotency key) is not — an
+//! audit trail exists to record what happened to genuine attempts, not
+//! to double as client-side validation noise.
+//!
+//! `QaasMcpServer::audit` opens its own log at `data_dir/audit.log`,
+//! alongside the queue WALs and the API-key store — the same "one
+//! durable file per durable concern" shape this server already uses.
+//! [`DashboardSnapshot::audit_events_written`] and
+//! [`DashboardSnapshot::audit_events_dropped`] surface
+//! [`qaas_core::AuditLogger::written`]/[`qaas_core::AuditLogger::dropped`]
+//! through the same operator-facing dashboard `feature/monitoring-dashboard`
+//! already built — the "expose this as a metric, don't silently ignore
+//! it" expectation that module's own docs set for a logger whose whole
+//! design accepts dropping events under real backpressure.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -313,9 +341,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use qaas_core::{
-    AdmissionConfig, AdmissionController, AdmissionDecision, ApiKeyStore, ConsumerGroup, Embedding,
-    EmbeddingIndex, LeaseToken, PartialResultsPoll, QuotaConfig, QuotaDecision, RetryPolicy,
-    TenantId, TenantQuota, TriageClassification, TriageVerdict,
+    AdmissionConfig, AdmissionController, AdmissionDecision, ApiKeyStore, AuditLogger,
+    AuditLoggerConfig, ConsumerGroup, Embedding, EmbeddingIndex, LeaseToken, PartialResultsPoll,
+    QuotaConfig, QuotaDecision, RetryPolicy, TenantId, TenantQuota, TriageClassification,
+    TriageVerdict,
 };
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::service::RequestContext;
@@ -950,6 +979,15 @@ pub struct DashboardSnapshot {
     pub queues: Vec<QueueStatus>,
     /// Every tenant with at least one open queue.
     pub tenants: Vec<TenantStatus>,
+    /// How many audit-log events have been durably written since this
+    /// process started — see [`qaas_core::AuditLogger::written`].
+    pub audit_events_written: u64,
+    /// How many audit-log events have been dropped (the logger's
+    /// workers fell behind its bounded queue) since this process
+    /// started — see [`qaas_core::AuditLogger::dropped`]. Non-zero here
+    /// is worth an operator's attention: it means some `enqueue`/`ack`/
+    /// `nack` calls happened with no compliance record of them at all.
+    pub audit_events_dropped: u64,
 }
 
 /// Arguments for the `enqueue` tool.
@@ -1550,12 +1588,54 @@ struct TenantQuotaStatusResult {
     window_seconds: u64,
 }
 
-/// The MCP server itself. Cheap to clone — the only state is two
-/// `Arc`'d pieces, [`QueueRegistry`] and [`ApiKeyStore`] — which `rmcp`
-/// relies on internally when handling more than one tool call
-/// concurrently over the same connection, and which `crate::http_auth`'s
-/// middleware also needs a handle to, independently of any particular
-/// connection.
+/// One audited event — `feature/structured-audit-logging`'s durable
+/// compliance/debugging trail of every `enqueue`/`ack`/`nack` call.
+/// `qaas_core::AuditLogger` is deliberately generic over the event type
+/// it logs (see that module's own docs); this is `qaas-server`'s own
+/// shape for it, the same "generic primitive in `qaas-core`, real event
+/// shape defined where the domain knowledge to build one lives"
+/// split every other `qaas-core` primitive already follows.
+///
+/// `tenant` is always the plain [`tenant_label`] string (`"none"` for
+/// stdio), not `Option<TenantId>` — this is a log record meant to be
+/// read back later by a person or a compliance tool, not further
+/// processed by this server, so it carries the same display-ready shape
+/// every metric label in this file already uses rather than making a
+/// future reader re-derive it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum AuditEvent {
+    /// An `enqueue` call, successful or denied. Malformed requests
+    /// (an invalid embedding, an unparseable idempotency key) never
+    /// reach this far and are never logged — see this module's own docs
+    /// on why an audit trail cares about what happened to genuine
+    /// attempts, not client-side validation noise.
+    Enqueue {
+        tenant: String,
+        queue: String,
+        /// `None` for a request `enqueue` denied before a message ever
+        /// existed (a quota or admission ceiling) — `Some` either way
+        /// once one does, `deduplicated` distinguishing a genuinely new
+        /// message from a collapsed near-duplicate.
+        message_id: Option<String>,
+        deduplicated: bool,
+        /// `None` on success; the denial reason otherwise, in the same
+        /// words the MCP error response itself carries.
+        denied: Option<String>,
+    },
+    /// An `ack` call. Logged either way — `acked: false` (a stale or
+    /// unknown lease) is itself a meaningful compliance fact, not just
+    /// a no-op.
+    Ack { tenant: String, queue: String, message_id: String, acked: bool },
+    /// A `nack` call, same "log the outcome either way" stance as `Ack`.
+    Nack { tenant: String, queue: String, message_id: String, nacked: bool, reason: Option<String> },
+}
+
+/// The MCP server itself. Cheap to clone — the only state is three
+/// `Arc`'d pieces, [`QueueRegistry`], [`ApiKeyStore`], and an
+/// [`AuditLogger`] — which `rmcp` relies on internally when handling
+/// more than one tool call concurrently over the same connection, and
+/// which `crate::http_auth`'s middleware also needs a handle to,
+/// independently of any particular connection.
 #[derive(Clone)]
 pub struct QaasMcpServer {
     registry: Arc<QueueRegistry>,
@@ -1564,25 +1644,33 @@ pub struct QaasMcpServer {
     /// server at all — can authenticate a bearer credential against it
     /// directly, without going through a tool call to do so.
     pub api_keys: Arc<ApiKeyStore>,
+    audit: Arc<AuditLogger<AuditEvent>>,
 }
 
 #[tool_router]
 impl QaasMcpServer {
-    /// Opens (creating if necessary) queue WAL files under `data_dir`
-    /// and the API-key store at `data_dir/api_keys.log`, returning a
-    /// server ready to be handed to
+    /// Opens (creating if necessary) queue WAL files under `data_dir`,
+    /// the API-key store at `data_dir/api_keys.log`, and the audit log
+    /// at `data_dir/audit.log`, returning a server ready to be handed to
     /// [`ServiceExt::serve`](rmcp::ServiceExt::serve) — for stdio, and,
     /// wrapped in `crate::http_auth`'s middleware first, for the
     /// streamable-HTTP transport `main.rs` also stands up.
     ///
     /// # Errors
     ///
-    /// Returns an error if opening the API-key store's WAL fails — see
-    /// [`ApiKeyStore::open`](qaas_core::ApiKeyStore::open).
+    /// Returns an error if opening the API-key store's WAL, or the audit
+    /// log's, fails — see [`ApiKeyStore::open`](qaas_core::ApiKeyStore::open)
+    /// and [`AuditLogger::open`].
     pub async fn new(data_dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let data_dir = data_dir.into();
         let api_keys = ApiKeyStore::open(data_dir.join("api_keys.log")).await?;
-        Ok(Self { registry: Arc::new(QueueRegistry::new(data_dir)), api_keys: Arc::new(api_keys) })
+        let audit =
+            AuditLogger::open(data_dir.join("audit.log"), AuditLoggerConfig::DEFAULT).await?;
+        Ok(Self {
+            registry: Arc::new(QueueRegistry::new(data_dir)),
+            api_keys: Arc::new(api_keys),
+            audit: Arc::new(audit),
+        })
     }
 
     /// A full point-in-time [`DashboardSnapshot`] — the only thing
@@ -1595,6 +1683,8 @@ impl QaasMcpServer {
             generated_at_ms: qaas_types::Timestamp::now().0,
             queues: self.registry.queue_snapshots().await,
             tenants: self.registry.tenant_snapshots().await,
+            audit_events_written: self.audit.written(),
+            audit_events_dropped: self.audit.dropped(),
         }
     }
 
@@ -1653,6 +1743,28 @@ impl QaasMcpServer {
         self.enqueue_impl(self.authorize(&ctx).await?, params).await
     }
 
+    /// Logs one `enqueue` attempt's outcome — split out of `enqueue_impl`
+    /// itself purely to keep each of its four exit points (dedup
+    /// collapse, a pending-message denial, an admission denial, a real
+    /// new message) to one line apiece instead of repeating this whole
+    /// shape at each.
+    fn audit_enqueue(
+        &self,
+        tenant: Option<&TenantId>,
+        queue: &str,
+        message_id: Option<String>,
+        deduplicated: bool,
+        denied: Option<String>,
+    ) {
+        self.audit.log(AuditEvent::Enqueue {
+            tenant: tenant_label(tenant),
+            queue: queue.to_string(),
+            message_id,
+            deduplicated,
+            denied,
+        });
+    }
+
     /// The actual `enqueue` logic, taking `tenant` directly rather than a
     /// [`RequestContext`] — split out so tests can call it (including
     /// with an explicit `Some(tenant)`, to exercise isolation) without
@@ -1699,6 +1811,13 @@ impl QaasMcpServer {
             && let Some((existing_id, similarity)) = dedup.nearest(embedding).await
             && similarity >= DEDUP_SIMILARITY_THRESHOLD
         {
+            self.audit_enqueue(
+                tenant.as_ref(),
+                &queue_name,
+                Some(existing_id.to_string()),
+                true,
+                None,
+            );
             return Ok(Json(EnqueueResult {
                 message_id: existing_id.to_string(),
                 queue: queue_name,
@@ -1722,14 +1841,13 @@ impl QaasMcpServer {
         {
             let current = self.registry.tenant_pending_total(tenant).await;
             if current >= max_pending {
-                return Err(ErrorData::invalid_request(
-                    format!(
-                        "tenant {:?} already has {current} pending messages across its queues, \
-                         at its {max_pending}-message limit - configure_tenant_quota can raise it",
-                        tenant.as_str()
-                    ),
-                    None,
-                ));
+                let reason = format!(
+                    "tenant {:?} already has {current} pending messages across its queues, \
+                     at its {max_pending}-message limit - configure_tenant_quota can raise it",
+                    tenant.as_str()
+                );
+                self.audit_enqueue(Some(tenant), &queue_name, None, false, Some(reason.clone()));
+                return Err(ErrorData::invalid_request(reason, None));
             }
         }
 
@@ -1741,6 +1859,7 @@ impl QaasMcpServer {
                 (tokens_remaining, cost_remaining)
             }
             AdmissionDecision::Denied { reason, retry_after } => {
+                self.audit_enqueue(tenant.as_ref(), &queue_name, None, false, Some(reason.clone()));
                 return Err(throttled_to_mcp(&reason, retry_after));
             }
         };
@@ -1756,6 +1875,7 @@ impl QaasMcpServer {
         }
 
         record_queue_metrics(tenant.as_ref(), &queue_name, &group).await;
+        self.audit_enqueue(tenant.as_ref(), &queue_name, Some(message_id.to_string()), false, None);
 
         Ok(Json(EnqueueResult {
             message_id: message_id.to_string(),
@@ -1941,6 +2061,13 @@ impl QaasMcpServer {
 
             record_queue_metrics(tenant.as_ref(), &params.queue, &group).await;
         }
+
+        self.audit.log(AuditEvent::Ack {
+            tenant: tenant_label(tenant.as_ref()),
+            queue: params.queue,
+            message_id: message_id.to_string(),
+            acked,
+        });
         Ok(Json(AckResult { acked }))
     }
 
@@ -1966,6 +2093,7 @@ impl QaasMcpServer {
         let group = self.registry.get(tenant.as_ref(), &params.queue).await?;
         let message_id = parse_message_id(&params.message_id)?;
         let token = LeaseToken::from_u64(params.lease_token);
+        let reason = params.reason.clone();
 
         let nacked = group
             .nack(message_id, token, params.reason)
@@ -1975,6 +2103,14 @@ impl QaasMcpServer {
         if nacked {
             record_queue_metrics(tenant.as_ref(), &params.queue, &group).await;
         }
+
+        self.audit.log(AuditEvent::Nack {
+            tenant: tenant_label(tenant.as_ref()),
+            queue: params.queue,
+            message_id: message_id.to_string(),
+            nacked,
+            reason,
+        });
         Ok(Json(NackResult { nacked }))
     }
 
@@ -4541,5 +4677,217 @@ mod tests {
         assert!((queue.cost_used - 1.5).abs() < f64::EPSILON);
         assert_eq!(queue.cost_ceiling_per_window, Some(5.0));
         assert_eq!(queue.dead_letters, 0);
+    }
+
+    /// The on-disk shape of one audit record, as `qaas_core::AuditLogger`
+    /// actually serializes it (`{at, event}`, `Wal`'s own JSON framing) -
+    /// defined locally rather than imported since `AuditLogger`'s own
+    /// `AuditRecord` wrapper is private to `qaas-core`. Deserializing
+    /// against this equivalent shape is exactly as valid as deserializing
+    /// against the original type, since JSON round-tripping only ever
+    /// cares about field names matching, not Rust type identity.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct AuditRecordShape {
+        #[allow(dead_code)]
+        at: qaas_types::Timestamp,
+        event: super::AuditEvent,
+    }
+
+    /// Polls `server`'s own `written()`/`dropped()` counters (an
+    /// in-memory, race-free signal - see `qaas_core::audit`'s own tests
+    /// for why reopening a `Wal` a background writer might still be
+    /// appending to is a real hazard worth avoiding) until `expected`
+    /// events have been accounted for, then reads the real audit log
+    /// back from `dir` exactly once.
+    async fn wait_for_audit_events(
+        server: &QaasMcpServer,
+        dir: &tempfile::TempDir,
+        expected: u64,
+    ) -> Vec<super::AuditEvent> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while server.audit.written() + server.audit.dropped() < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("audit workers should have caught up well within 30s");
+
+        let (_wal, records) =
+            qaas_core::Wal::<AuditRecordShape>::open(dir.path().join("audit.log")).await.unwrap();
+        records.into_iter().map(|record| record.event).collect()
+    }
+
+    #[tokio::test]
+    async fn a_successful_enqueue_is_audit_logged() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        let result = server
+            .enqueue_impl(Some(tenant), enqueue_params("orders", json!("a")))
+            .await
+            .unwrap()
+            .0;
+
+        let events = wait_for_audit_events(&server, &dir, 1).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            super::AuditEvent::Enqueue { tenant, queue, message_id, deduplicated, denied } => {
+                assert_eq!(tenant, "tenant-a");
+                assert_eq!(queue, "orders");
+                assert_eq!(message_id.as_deref(), Some(result.message_id.as_str()));
+                assert!(!deduplicated);
+                assert_eq!(denied, &None);
+            }
+            other => panic!("expected an Enqueue event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deduplicated_enqueue_is_audit_logged_as_such() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let embedding = vec![1.0, 0.0, 0.0];
+
+        server
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(embedding.clone()),
+                    ..enqueue_params("orders", json!("first"))
+                },
+            )
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(
+                None,
+                super::EnqueueParams {
+                    embedding: Some(embedding),
+                    ..enqueue_params("orders", json!("near-duplicate"))
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = wait_for_audit_events(&server, &dir, 2).await;
+        let super::AuditEvent::Enqueue { deduplicated, denied, .. } = &events[1] else {
+            panic!("expected the second event to be an Enqueue, got {:?}", events[1]);
+        };
+        assert!(deduplicated);
+        assert_eq!(denied, &None);
+    }
+
+    #[tokio::test]
+    async fn a_quota_denied_enqueue_is_audit_logged_with_a_reason() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_tenant_quota_impl(
+                None,
+                super::ConfigureTenantQuotaParams {
+                    tenant_id: "tenant-a".to_string(),
+                    max_queues: None,
+                    max_pending_messages: Some(0),
+                    requests_per_window: None,
+                    window_seconds: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = server.enqueue_impl(Some(tenant), enqueue_params("orders", json!("a"))).await;
+        assert!(result.is_err());
+
+        let events = wait_for_audit_events(&server, &dir, 1).await;
+        match &events[0] {
+            super::AuditEvent::Enqueue { message_id, denied, .. } => {
+                assert_eq!(message_id, &None);
+                assert!(denied.is_some());
+            }
+            other => panic!("expected an Enqueue event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_and_nack_are_both_audit_logged_including_stale_leases() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let claimed =
+            server.enqueue_impl(None, enqueue_params("orders", json!("a"))).await.unwrap().0;
+        let claim = server
+            .claim_impl(None, super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(50) })
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(claim.message_id.as_deref(), Some(claimed.message_id.as_str()));
+
+        // A real ack.
+        server
+            .ack_impl(
+                None,
+                super::AckParams {
+                    queue: "orders".to_string(),
+                    message_id: claim.message_id.clone().unwrap(),
+                    lease_token: claim.lease_token.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        // A stale nack against the same, already-acked lease.
+        server
+            .nack_impl(
+                None,
+                super::NackParams {
+                    queue: "orders".to_string(),
+                    message_id: claim.message_id.unwrap(),
+                    lease_token: claim.lease_token.unwrap(),
+                    reason: Some("simulated failure".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        // enqueue + ack + nack = 3 audit events.
+        let events = wait_for_audit_events(&server, &dir, 3).await;
+        let ack = events.iter().find_map(|event| match event {
+            super::AuditEvent::Ack { acked, .. } => Some(*acked),
+            _ => None,
+        });
+        let nack = events.iter().find_map(|event| match event {
+            super::AuditEvent::Nack { nacked, reason, .. } => Some((*nacked, reason.clone())),
+            _ => None,
+        });
+        assert_eq!(ack, Some(true));
+        assert_eq!(
+            nack,
+            Some((false, Some("simulated failure".to_string()))),
+            "the lease was already resolved by the ack above, so this nack must be logged as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_are_never_audit_logged() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        // Neither queue nor embedding given - rejected before any real
+        // business logic runs, so this must never reach the audit log.
+        let result = server
+            .enqueue_impl(
+                None,
+                super::EnqueueParams { queue: None, ..enqueue_params("unused", json!("x")) },
+            )
+            .await;
+        assert!(result.is_err());
+
+        // Give any (incorrectly) spawned audit write a moment to happen
+        // before asserting its absence.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.audit.written(), 0);
+        assert_eq!(server.audit.dropped(), 0);
     }
 }
