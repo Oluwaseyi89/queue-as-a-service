@@ -37,6 +37,24 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 http = "1"
 jsonwebtoken = "9"
 tower = { version = "0.5", default-features = false, features = ["util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+# Dev-only: its DebuggingRecorder is what actually lets qaas-server's own
+# tests assert a gauge/histogram was recorded with the right value and
+# labels, rather than only trusting the wiring compiles.
+metrics-util = "0.20"
+# Pinned to 0.32, not the newer 0.33 `opentelemetry`/`opentelemetry_sdk`/
+# `opentelemetry-otlp` publish first: `tracing-opentelemetry` 0.33.0 (the
+# bridge that actually matters here) still depends on `opentelemetry
+# 0.32`, and Cargo's own SemVer rules treat every 0.x minor bump as
+# breaking, so mixing 0.33 core crates with the 0.33 bridge produces two
+# incompatible copies of the same types instead of one - caught by
+# inspecting `tracing-opentelemetry`'s own installed `Cargo.toml` before
+# picking versions, not assumed from "latest is always right."
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 
 # Workspace-wide lint policy. Every member crate opts in with
 # `[lints] workspace = true` so we don't have to repeat this four times.
