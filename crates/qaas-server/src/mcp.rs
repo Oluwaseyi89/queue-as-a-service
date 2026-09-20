@@ -254,6 +254,58 @@
 //! configuration and live usage (queues open, pending messages, requests
 //! this window), while the stdio connection must name which tenant to
 //! report on, since it has no tenant of its own to default to.
+//!
+//! # Tracing and metrics (`feature/tracing-metrics`)
+//!
+//! Every `#[tool]`-dispatched method's `_impl` sibling now carries
+//! `#[tracing::instrument(skip_all, fields(tenant = ...))]` — a real span
+//! per tool call, nested under whatever `rmcp` itself already emits, with
+//! the resolved tenant (`"none"` for stdio) as a field. `qaas_core`'s own
+//! `ConsumerGroup` methods gained the same attribute this branch (see
+//! that crate's docs), so a single agent's `claim` → work → `ack` already
+//! shows up as a proper parent/child span chain with zero extra plumbing
+//! here — `main.rs`'s [`crate::telemetry::init_tracing`] is what turns
+//! those spans into exported `OpenTelemetry` traces, opt-in via
+//! `QAAS_OTEL_ENDPOINT`.
+//!
+//! Three Prometheus metrics, recorded via [`record_queue_metrics`] and,
+//! for the third, directly in [`QaasMcpServer::ack_impl`] — every one
+//! labeled by `queue` and `tenant`, `Plan.md`'s own "per-queue and
+//! per-agent" breakdown, where `tenant` is the closest thing this project
+//! has to an agent identity axis (see `crate::telemetry`'s own docs on
+//! why that's the right reading):
+//!
+//! - `qaas_queue_depth` — a gauge, [`qaas_core::ConsumerGroup::len`]
+//!   re-recorded after every `enqueue`/`claim`/`ack`/`nack` that could
+//!   have changed it.
+//! - `qaas_queue_oldest_pending_age_seconds` — a gauge, this branch's
+//!   consumer-lag signal: how long the oldest still-claimable message on
+//!   a queue has been waiting, from the new
+//!   [`qaas_core::ConsumerGroup::oldest_pending_age`].
+//! - `qaas_message_latency_seconds` — a histogram, this branch's
+//!   "latency percentiles" signal: end-to-end time from a message's
+//!   enqueue to its successful `ack`, read straight off the acked
+//!   message's own id (`MessageId` embeds its own generation time — see
+//!   [`qaas_types::MessageId::timestamp`]) rather than a separately
+//!   tracked "claimed at" field. Recorded only on a real ack, not a
+//!   nack — a nacked message isn't done yet, so "how long did it take"
+//!   has no answer until whichever ack eventually resolves it.
+//!
+//! Read as "the queue itself," not "the RPC layer," deliberately: a
+//! fourth, tool-call-duration histogram (mirroring the rate limiter's
+//! own proxied-request latency more literally) was considered and left
+//! out — `Plan.md`'s line names exactly these three queueing-theory
+//! metrics, and inventing a fourth un-requested one is exactly the kind
+//! of scope creep this project's branches otherwise avoid. Depth, lag,
+//! and message latency already jointly describe a queue's health the
+//! way Little's law relates them; per-call RPC timing is a reasonable
+//! future addition, not a gap this branch leaves half-finished.
+//!
+//! Metrics are served from their own listener
+//! ([`crate::telemetry::init_metrics`]), not a route on this module's own
+//! HTTP transport — see that module's docs for why: this data is
+//! inherently cross-tenant and operator-facing, not something a single
+//! tenant's API key should unlock.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -391,6 +443,46 @@ fn throttled_to_mcp(reason: &str, retry_after: Option<Duration>) -> ErrorData {
         reason.to_string(),
         Some(serde_json::json!({ "retry_after_seconds": retry_after.map(|d| d.as_secs_f64()) })),
     )
+}
+
+/// The tenant-axis label used on every metric this module records —
+/// `"none"` for the trusted stdio connection, an owned copy of the
+/// tenant id otherwise. `metrics`' own macros require a label value that
+/// resolves to `String` or `&'static str` (see their doc comments); a
+/// borrowed `&str` tied to `tenant`'s own lifetime satisfies neither, so
+/// this always allocates rather than trying to thread a borrow through
+/// call sites that frequently don't have one long enough to give.
+fn tenant_label(tenant: Option<&TenantId>) -> String {
+    tenant.map_or_else(|| "none".to_string(), |tenant| tenant.as_str().to_string())
+}
+
+/// Updates this module's two queue-shaped gauges for `queue` — see the
+/// module docs for what each measures. Every tool that can change a
+/// queue's depth or its oldest-pending message's age (`enqueue`,
+/// `claim`, `ack`, `nack`) calls this once it's done, so a scrape always
+/// reflects the queue's state as of the most recent operation against
+/// it rather than needing a separate polling loop to keep these gauges
+/// current.
+async fn record_queue_metrics(
+    tenant: Option<&TenantId>,
+    queue: &str,
+    group: &ConsumerGroup<serde_json::Value>,
+) {
+    let tenant = tenant_label(tenant);
+    let queue = queue.to_string();
+
+    // `usize`/`u64` -> `f64`: a queue depth or an age in seconds could in
+    // principle lose precision above 2^53, a scale this project will
+    // never see a single queue reach — narrower than pretending the
+    // conversion could realistically fail.
+    #[allow(clippy::cast_precision_loss)]
+    let depth = group.len().await as f64;
+    metrics::gauge!("qaas_queue_depth", "queue" => queue.clone(), "tenant" => tenant.clone())
+        .set(depth);
+
+    let lag = group.oldest_pending_age().await.map_or(0.0, |age| age.as_secs_f64());
+    metrics::gauge!("qaas_queue_oldest_pending_age_seconds", "queue" => queue, "tenant" => tenant)
+        .set(lag);
 }
 
 /// Lazily opens and holds one [`ConsumerGroup`], one
@@ -1343,6 +1435,7 @@ impl QaasMcpServer {
     /// every dispatch-layer method in this file has a `_impl` sibling
     /// tests can call without a real MCP connection to construct a
     /// context from.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn authorize_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1377,6 +1470,7 @@ impl QaasMcpServer {
     /// needing a real MCP connection to construct a context from, since
     /// `rmcp` gives no public way to build one outside of actually
     /// serving a client.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn enqueue_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1472,6 +1566,8 @@ impl QaasMcpServer {
             dedup.insert(message_id, embedding).await;
         }
 
+        record_queue_metrics(tenant.as_ref(), &queue_name, &group).await;
+
         Ok(Json(EnqueueResult {
             message_id: message_id.to_string(),
             queue: queue_name,
@@ -1539,6 +1635,7 @@ impl QaasMcpServer {
 
     /// The actual `claim` logic — see [`Self::enqueue_impl`]'s docs on
     /// why this is split out from the `#[tool]`-annotated method.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn claim_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1568,16 +1665,24 @@ impl QaasMcpServer {
             params.wait_ms.map_or(DEFAULT_CLAIM_WAIT, Duration::from_millis).min(MAX_CLAIM_WAIT);
 
         match tokio::time::timeout(wait, group.claim()).await {
-            Ok(claim) => Ok(Json(ClaimResult {
-                available: true,
-                throttled: false,
-                message_id: Some(claim.id.to_string()),
-                lease_token: Some(claim.token.as_u64()),
-                idempotency_key: Some(claim.idempotency_key.as_str().to_string()),
-                payload: Some(claim.item),
-                delivery_count: Some(claim.delivery_count),
-                checkpoint: claim.checkpoint,
-            })),
+            Ok(claim) => {
+                // Total len() doesn't change on a claim (the message
+                // just moves from pending to leased), but which message
+                // is now the *oldest pending* one does - worth
+                // refreshing the lag gauge even though the depth gauge
+                // it shares a call with won't actually move.
+                record_queue_metrics(tenant.as_ref(), &params.queue, &group).await;
+                Ok(Json(ClaimResult {
+                    available: true,
+                    throttled: false,
+                    message_id: Some(claim.id.to_string()),
+                    lease_token: Some(claim.token.as_u64()),
+                    idempotency_key: Some(claim.idempotency_key.as_str().to_string()),
+                    payload: Some(claim.item),
+                    delivery_count: Some(claim.delivery_count),
+                    checkpoint: claim.checkpoint,
+                }))
+            }
             Err(_elapsed) => Ok(Json(ClaimResult {
                 available: false,
                 throttled: false,
@@ -1602,6 +1707,7 @@ impl QaasMcpServer {
     }
 
     /// The actual `ack` logic — see [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn ack_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1623,6 +1729,28 @@ impl QaasMcpServer {
             // that this server can't observe directly), just tighter
             // than waiting on it here.
             self.registry.dedup(tenant.as_ref(), &params.queue).await?.remove(&message_id).await;
+
+            // The "latency percentiles" metric: end-to-end time from
+            // enqueue to a *successful* resolution, read straight off
+            // message_id's own embedded generation time (see
+            // MessageId::timestamp's own docs) rather than a separately
+            // tracked "claimed at" field this server doesn't otherwise
+            // need. Recorded only here, not in nack - a nack means the
+            // message isn't actually done yet (it's retrying, or being
+            // dead-lettered), so "how long did it take" isn't answerable
+            // until whichever ack eventually resolves it for good.
+            let elapsed_ms =
+                qaas_types::Timestamp::now().0.saturating_sub(message_id.timestamp().0);
+            #[allow(clippy::cast_precision_loss)]
+            let elapsed_secs = elapsed_ms as f64 / 1000.0;
+            metrics::histogram!(
+                "qaas_message_latency_seconds",
+                "queue" => params.queue.clone(),
+                "tenant" => tenant_label(tenant.as_ref()),
+            )
+            .record(elapsed_secs);
+
+            record_queue_metrics(tenant.as_ref(), &params.queue, &group).await;
         }
         Ok(Json(AckResult { acked }))
     }
@@ -1640,6 +1768,7 @@ impl QaasMcpServer {
     }
 
     /// The actual `nack` logic — see [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn nack_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1653,6 +1782,10 @@ impl QaasMcpServer {
             .nack(message_id, token, params.reason)
             .await
             .map_err(|error| io_error_to_mcp(&error))?;
+
+        if nacked {
+            record_queue_metrics(tenant.as_ref(), &params.queue, &group).await;
+        }
         Ok(Json(NackResult { nacked }))
     }
 
@@ -1674,6 +1807,7 @@ impl QaasMcpServer {
     }
 
     /// The actual `checkpoint` logic — see [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn checkpoint_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1706,6 +1840,7 @@ impl QaasMcpServer {
 
     /// The actual `publish_partial_result` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn publish_partial_result_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1745,6 +1880,7 @@ impl QaasMcpServer {
 
     /// The actual `stream_partial_results` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn stream_partial_results_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1800,6 +1936,7 @@ impl QaasMcpServer {
 
     /// The actual `configure_admission` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn configure_admission_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1835,6 +1972,7 @@ impl QaasMcpServer {
 
     /// The actual `admission_status` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn admission_status_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1876,6 +2014,7 @@ impl QaasMcpServer {
 
     /// The actual `configure_route` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn configure_route_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1911,6 +2050,7 @@ impl QaasMcpServer {
 
     /// The actual `list_dead_letters` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn list_dead_letters_impl(
         &self,
         tenant: Option<TenantId>,
@@ -1960,6 +2100,7 @@ impl QaasMcpServer {
 
     /// The actual `triage_dead_letter` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn triage_dead_letter_impl(
         &self,
         tenant: Option<TenantId>,
@@ -2009,6 +2150,7 @@ impl QaasMcpServer {
 
     /// The actual `reprocess_dead_letter` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn reprocess_dead_letter_impl(
         &self,
         tenant: Option<TenantId>,
@@ -2038,6 +2180,7 @@ impl QaasMcpServer {
 
     /// The actual `purge_dead_letter` logic — see
     /// [`Self::enqueue_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(tenant.as_ref())))]
     async fn purge_dead_letter_impl(
         &self,
         tenant: Option<TenantId>,
@@ -2072,6 +2215,7 @@ impl QaasMcpServer {
     /// HTTP caller already authenticated as, if any — `None` means this
     /// call arrived over stdio, the only place this tool is allowed to
     /// be reached from.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(caller_tenant.as_ref())))]
     async fn create_api_key_impl(
         &self,
         caller_tenant: Option<TenantId>,
@@ -2111,6 +2255,7 @@ impl QaasMcpServer {
 
     /// The actual `revoke_api_key` logic — see
     /// [`Self::create_api_key_impl`]'s docs.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(caller_tenant.as_ref())))]
     async fn revoke_api_key_impl(
         &self,
         caller_tenant: Option<TenantId>,
@@ -2151,6 +2296,7 @@ impl QaasMcpServer {
     /// The actual `configure_tenant_quota` logic — see
     /// [`Self::create_api_key_impl`]'s docs on why this takes
     /// `caller_tenant` directly rather than a `RequestContext`.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(caller_tenant.as_ref())))]
     async fn configure_tenant_quota_impl(
         &self,
         caller_tenant: Option<TenantId>,
@@ -2201,6 +2347,7 @@ impl QaasMcpServer {
 
     /// The actual `tenant_quota_status` logic — see
     /// [`Self::enqueue_impl`]'s docs on why this is split out.
+    #[tracing::instrument(skip_all, fields(tenant = %tenant_label(caller_tenant.as_ref())))]
     async fn tenant_quota_status_impl(
         &self,
         caller_tenant: Option<TenantId>,
@@ -2273,8 +2420,10 @@ impl ServerHandler for QaasMcpServer {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -2282,6 +2431,50 @@ mod tests {
 
     async fn server(dir: &tempfile::TempDir) -> QaasMcpServer {
         QaasMcpServer::new(dir.path()).await.unwrap()
+    }
+
+    /// Finds the recorded value for the metric named `name` carrying
+    /// exactly `labels` (order-independent) in `snapshot` (a
+    /// [`metrics_util::debugging::Snapshot`], already unpacked via
+    /// `into_vec` so a single snapshot can be queried more than once), or
+    /// `None` if nothing matches — a metric this branch never recorded
+    /// under those labels, not a test failure any other way a test could
+    /// observe, since `metrics::gauge!`/`histogram!` themselves never
+    /// report "not called."
+    fn metric_value(
+        snapshot: &[(
+            metrics_util::CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<DebugValue> {
+        let expected: BTreeSet<(&str, &str)> = labels.iter().copied().collect();
+        snapshot.iter().find_map(|(composite_key, _, _, value)| {
+            let key = composite_key.key();
+            if key.name() != name {
+                return None;
+            }
+            let actual: BTreeSet<(&str, &str)> =
+                key.labels().map(|label| (label.key(), label.value())).collect();
+            (actual == expected).then(|| value_clone(value))
+        })
+    }
+
+    /// [`DebugValue`] doesn't implement `Clone`, but every variant this
+    /// module actually asserts on (`Gauge`, `Histogram`) is trivially
+    /// reconstructible from its own inner data — cheaper than
+    /// restructuring [`metric_value`] to return a borrow tied to
+    /// `snapshot`'s lifetime for what's only ever used in test
+    /// assertions.
+    fn value_clone(value: &DebugValue) -> DebugValue {
+        match value {
+            DebugValue::Counter(count) => DebugValue::Counter(*count),
+            DebugValue::Gauge(gauge) => DebugValue::Gauge(*gauge),
+            DebugValue::Histogram(values) => DebugValue::Histogram(values.clone()),
+        }
     }
 
     /// Dead-letters a message directly through `qaas-core`, bypassing
@@ -3895,5 +4088,169 @@ mod tests {
         assert_eq!(status.tenant_id, "tenant-a");
         assert_eq!(status.queues_open, 1);
         assert_eq!(status.pending_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_records_the_queue_depth_gauge() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        server.enqueue_impl(Some(tenant), enqueue_params("orders", json!("first"))).await.unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let depth = metric_value(
+            &snapshot,
+            "qaas_queue_depth",
+            &[("queue", "orders"), ("tenant", "tenant-a")],
+        );
+        assert_eq!(depth, Some(DebugValue::Gauge(1.0.into())));
+    }
+
+    #[tokio::test]
+    async fn ack_records_a_lower_queue_depth_and_a_message_latency_sample() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("first")))
+            .await
+            .unwrap();
+        let claimed = server
+            .claim_impl(
+                Some(tenant.clone()),
+                super::ClaimParams { queue: "orders".to_string(), wait_ms: Some(50) },
+            )
+            .await
+            .unwrap()
+            .0;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        server
+            .ack_impl(
+                Some(tenant.clone()),
+                super::AckParams {
+                    queue: "orders".to_string(),
+                    message_id: claimed.message_id.unwrap(),
+                    lease_token: claimed.lease_token.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let depth = metric_value(
+            &snapshot,
+            "qaas_queue_depth",
+            &[("queue", "orders"), ("tenant", "tenant-a")],
+        );
+        assert_eq!(depth, Some(DebugValue::Gauge(0.0.into())));
+
+        let latency = metric_value(
+            &snapshot,
+            "qaas_message_latency_seconds",
+            &[("queue", "orders"), ("tenant", "tenant-a")],
+        );
+        let Some(DebugValue::Histogram(samples)) = latency else {
+            panic!("expected a recorded latency histogram sample, got {latency:?}");
+        };
+        assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0].0 >= 0.0 && samples[0].0 < 5.0,
+            "latency sample {:?} should be small and non-negative, just measured",
+            samples[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_never_records_metrics_for_a_stale_lease() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        server
+            .ack_impl(
+                Some(tenant),
+                super::AckParams {
+                    queue: "orders".to_string(),
+                    message_id: qaas_types::MessageId::new().to_string(),
+                    lease_token: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "qaas_message_latency_seconds",
+                &[("queue", "orders"), ("tenant", "tenant-a")]
+            ),
+            None,
+            "acking a lease that was never real should record nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_tenants_record_metrics_under_different_labels() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        server
+            .enqueue_impl(
+                Some(TenantId::new("tenant-a").unwrap()),
+                enqueue_params("orders", json!("a")),
+            )
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(
+                Some(TenantId::new("tenant-b").unwrap()),
+                enqueue_params("orders", json!("b1")),
+            )
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(
+                Some(TenantId::new("tenant-b").unwrap()),
+                enqueue_params("orders", json!("b2")),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "qaas_queue_depth",
+                &[("queue", "orders"), ("tenant", "tenant-a")]
+            ),
+            Some(DebugValue::Gauge(1.0.into())),
+        );
+        assert_eq!(
+            metric_value(
+                &snapshot,
+                "qaas_queue_depth",
+                &[("queue", "orders"), ("tenant", "tenant-b")]
+            ),
+            Some(DebugValue::Gauge(2.0.into())),
+        );
     }
 }
