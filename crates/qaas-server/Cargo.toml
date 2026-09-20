@@ -28,7 +28,14 @@ serde_json.workspace = true
 axum.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
+metrics-util.workspace = true
 tempfile.workspace = true
 tower.workspace = true
