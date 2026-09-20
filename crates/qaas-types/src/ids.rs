@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::Timestamp;
+
 /// A message's unique identifier.
 ///
 /// Backed by a `UUIDv7`, not v4: v7 embeds a millisecond timestamp in its
@@ -16,6 +18,34 @@ impl MessageId {
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::now_v7())
+    }
+
+    /// The instant this ID was generated, read directly back out of its
+    /// own embedded `UUIDv7` bits — not a separately stored field.
+    ///
+    /// `feature/tracing-metrics` is the first caller (a message's age is
+    /// exactly "how long ago was its ID generated," which is what a
+    /// consumer-lag or end-to-end-latency metric needs), but this reuses
+    /// what [`MessageId::new`]'s own doc comment already promised the ID
+    /// would carry rather than adding a second, redundant timestamp next
+    /// to it — the same "don't duplicate what an ID already encodes"
+    /// instinct that keeps `qaas_core`'s dead-letter and checkpoint
+    /// records from inventing their own sequence numbers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded timestamp is somehow not extractable — this
+    /// can only happen if a `MessageId` was ever constructed from
+    /// something other than a genuine `UUIDv7` (which every public
+    /// constructor here guarantees), so this is an invariant violation,
+    /// not a condition a caller can meaningfully recover from.
+    #[must_use]
+    pub fn timestamp(&self) -> Timestamp {
+        let uuid_timestamp =
+            self.0.get_timestamp().expect("MessageId is always constructed from a UUIDv7");
+        let (seconds, subsec_nanos) = uuid_timestamp.to_unix();
+        let millis = seconds * 1000 + u64::from(subsec_nanos) / 1_000_000;
+        Timestamp(millis)
     }
 }
 
@@ -104,6 +134,8 @@ pub struct InvalidIdempotencyKey;
 
 #[cfg(test)]
 mod tests {
+    use crate::Timestamp;
+
     use super::{IdempotencyKey, MessageId, TraceId};
 
     #[test]
@@ -111,6 +143,25 @@ mod tests {
         let first = MessageId::new();
         let second = MessageId::new();
         assert!(second > first);
+    }
+
+    #[test]
+    fn timestamp_matches_generation_time_to_the_millisecond() {
+        let before = Timestamp::now();
+        let id = MessageId::new();
+        let after = Timestamp::now();
+        let extracted = id.timestamp();
+        assert!(
+            extracted >= before && extracted <= after,
+            "extracted {extracted:?} should fall between {before:?} and {after:?}"
+        );
+    }
+
+    #[test]
+    fn later_ids_have_a_timestamp_that_never_goes_backwards() {
+        let first = MessageId::new().timestamp();
+        let second = MessageId::new().timestamp();
+        assert!(second >= first);
     }
 
     #[test]

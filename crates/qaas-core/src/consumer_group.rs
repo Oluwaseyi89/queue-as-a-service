@@ -492,6 +492,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     ///
     /// Returns an error if the WAL write fails; `item` is not enqueued
     /// in that case.
+    #[tracing::instrument(skip_all, ret)]
     pub async fn enqueue(&self, item: T) -> io::Result<MessageId> {
         self.enqueue_with_id_and_key(MessageId::new(), item, None).await
     }
@@ -513,6 +514,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// case, and the key is released so a later, successful enqueue with
     /// it isn't wrongly deduplicated against a write that never actually
     /// happened.
+    #[tracing::instrument(skip(self, item), ret)]
     pub async fn enqueue_with_key(
         &self,
         item: T,
@@ -611,6 +613,31 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
         self.len().await == 0
     }
 
+    /// How long the oldest still-claimable message has been waiting —
+    /// `None` if nothing is currently pending (empty, or everything
+    /// outstanding is leased or in retry backoff). `feature/tracing-metrics`'s
+    /// consumer-lag signal: the more this grows, the further behind this
+    /// queue's consumers are falling relative to what's arriving.
+    ///
+    /// Deliberately only looks at `pending`, not `leased` or `delayed` —
+    /// a message currently out on lease is actively being worked, and one
+    /// waiting out a retry backoff is intentionally paused, neither of
+    /// which is "falling behind" the way a message that's been sitting
+    /// claimable with nobody taking it is.
+    ///
+    /// Costs nothing extra to compute: every [`MessageId`] already embeds
+    /// its own generation time (see [`MessageId::timestamp`]), so the
+    /// oldest pending entry's age is just that timestamp compared against
+    /// now — no separate "when was this enqueued" field to keep in sync
+    /// with `Pending` itself.
+    pub async fn oldest_pending_age(&self) -> Option<Duration> {
+        let state = self.state.lock().await;
+        let oldest = state.pending.front()?;
+        let enqueued_at = oldest.id.timestamp();
+        let now = Timestamp::now();
+        Some(Duration::from_millis(now.0.saturating_sub(enqueued_at.0)))
+    }
+
     /// Claims the next available message, waiting if none is currently
     /// claimable, and grants a lease on it for this group's visibility
     /// timeout.
@@ -636,6 +663,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// the message being dead-lettered. Prefer a timeout comfortably
     /// longer than this group's WAL write latency (milliseconds to tens
     /// of milliseconds, typically) over an aggressive one.
+    #[tracing::instrument(skip_all)]
     pub async fn claim(&self) -> Claim<T>
     where
         T: Clone,
@@ -709,6 +737,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// the message is durably present from the original enqueue either
     /// way, so it's still recoverable on the next restart, just not
     /// removed from this running process's pending set.
+    #[tracing::instrument(skip(self), ret)]
     pub async fn ack(&self, id: MessageId, token: LeaseToken) -> io::Result<bool> {
         {
             let mut state = self.state.lock().await;
@@ -752,6 +781,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// fails. A nack that doesn't exhaust the policy never does I/O and
     /// can't fail this way — scheduling a retry is purely an in-memory
     /// operation.
+    #[tracing::instrument(skip(self), ret)]
     pub async fn nack(
         &self,
         id: MessageId,
@@ -835,6 +865,7 @@ impl<T: Serialize + DeserializeOwned> ConsumerGroup<T> {
     /// exactly as it was before this call — a failed checkpoint write
     /// must not silently look like it succeeded to a caller checking
     /// `Claim::checkpoint` after a later crash and replay.
+    #[tracing::instrument(skip(self, state), ret)]
     pub async fn checkpoint(
         &self,
         id: MessageId,
@@ -1556,6 +1587,53 @@ mod tests {
         let _claim = group.claim().await;
         assert_eq!(group.len().await, 2);
         assert!(!group.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_age_is_none_for_an_empty_queue() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        assert_eq!(group.oldest_pending_age().await, None);
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_age_reports_a_small_but_nonzero_duration_right_after_enqueue() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+
+        let age = group.oldest_pending_age().await.expect("one message is pending");
+        // Generous upper bound - this only needs to prove the age tracks
+        // real elapsed time, not pin down exact scheduler timing.
+        assert!(age < Duration::from_secs(5), "age {age:?} should be small, just measured");
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_age_ignores_leased_and_delayed_messages() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+        let _claim = group.claim().await;
+
+        // The only message that exists is now out on lease, not pending -
+        // oldest_pending_age must not count it.
+        assert_eq!(group.oldest_pending_age().await, None);
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_age_only_reflects_the_front_of_the_queue() {
+        let dir = tempdir().unwrap();
+        let group = open(&dir, LONG_TIMEOUT).await;
+        group.enqueue(1).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        group.enqueue(2).await.unwrap();
+
+        // The first-enqueued message is still the oldest pending one, so
+        // its age (not the second, more-recent message's) is what's
+        // reported - at least the ~20ms that's actually elapsed since it
+        // was enqueued.
+        let age = group.oldest_pending_age().await.unwrap();
+        assert!(age >= Duration::from_millis(15), "age {age:?} should reflect the older message");
     }
 
     #[tokio::test]

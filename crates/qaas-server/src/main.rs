@@ -30,9 +30,23 @@
 //! it's a local subprocess connection, not a network boundary, and
 //! nothing about adding a second, network-facing transport changes what
 //! the first one already was.
+//!
+//! # `feature/tracing-metrics`: a third listener, for operators only
+//!
+//! [`telemetry::init_metrics`] starts a Prometheus scrape endpoint on
+//! its own address (`QAAS_METRICS_ADDR`) — deliberately not a route on
+//! the same listener [`serve_http`] already binds, and not behind
+//! [`http_auth::require_tenant`] either. See `telemetry`'s own module
+//! docs for why: metrics here are cross-tenant, operator-facing data,
+//! not something a tenant's own API key was ever meant to unlock.
+//! [`telemetry::init_tracing`] replaces the bare
+//! `tracing_subscriber::fmt().init()` this file used to call directly —
+//! same stderr-writing behavior, now also wired to export spans via
+//! `OpenTelemetry` if `QAAS_OTEL_ENDPOINT` is set.
 
 mod http_auth;
 mod mcp;
+mod telemetry;
 
 use std::sync::Arc;
 
@@ -53,15 +67,7 @@ const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() {
-    // `tracing_subscriber::fmt`'s default writer is stdout - fine for a
-    // process with no other use for that stream, but this one's stdio
-    // transport *is* that stream: any log line sharing it with JSON-RPC
-    // traffic corrupts the protocol for whichever client is on the other
-    // end. Found and fixed in this branch (`feature/api-auth`) while
-    // smoke-testing `create_api_key` over a real stdio connection for the
-    // first time - every earlier branch's stdio testing apparently never
-    // exercised a client strict enough to notice.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    telemetry::init_tracing();
 
     let data_dir = std::env::var("QAAS_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
     if let Err(error) = tokio::fs::create_dir_all(&data_dir).await {
@@ -76,6 +82,21 @@ async fn main() {
             return;
         }
     };
+
+    let metrics_addr = std::env::var("QAAS_METRICS_ADDR")
+        .unwrap_or_else(|_| telemetry::DEFAULT_METRICS_ADDR.to_string());
+    match metrics_addr.parse() {
+        Ok(addr) => {
+            if let Err(error) = telemetry::init_metrics(addr) {
+                tracing::error!(%error, %metrics_addr, "failed to start Prometheus metrics listener");
+            } else {
+                tracing::info!(%metrics_addr, "starting Prometheus metrics listener");
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %metrics_addr, "QAAS_METRICS_ADDR is not a valid address");
+        }
+    }
 
     let http_addr =
         std::env::var("QAAS_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string());

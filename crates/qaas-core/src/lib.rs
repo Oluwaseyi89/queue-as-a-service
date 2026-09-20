@@ -148,6 +148,28 @@
 //! this branch is what finally gives an operator a knob for the question
 //! isolation alone never answered - how much of the *shared* process a
 //! given tenant gets to use.
+//!
+//! `feature/tracing-metrics` opens Phase 6 and adds no module of its
+//! own — everything it needs already existed or is a small, targeted
+//! addition to what's here. [`ConsumerGroup::oldest_pending_age`] is the
+//! new piece: how long the oldest still-claimable message has been
+//! waiting, computed with no new field to keep in sync, because
+//! [`qaas_types::MessageId`] already embeds its own generation time (see
+//! [`MessageId::timestamp`](qaas_types::MessageId::timestamp), also new
+//! this branch) — `qaas-server`'s consumer-lag metric is this value,
+//! labeled by queue and tenant at the one layer that knows either. The
+//! rest of this branch is `#[tracing::instrument]` on [`ConsumerGroup`]'s
+//! existing public methods (`enqueue`, `claim`, `ack`, `nack`,
+//! `checkpoint`) — spans this crate already had the `tracing` dependency
+//! to emit (see [`circuit_breaker`]'s own `tracing::info!`/`warn!` calls,
+//! from long before this branch), now exported as real distributed
+//! traces once `qaas-server` registers an `OpenTelemetry` layer on top of
+//! the same subscriber. Nothing here talks to `OpenTelemetry`, Prometheus,
+//! or any tenant/queue identity directly — this crate still doesn't know
+//! what a tenant or a queue name is, the same boundary [`admission`] and
+//! [`quota`] already hold; exporting spans and recording metrics with
+//! real labels is `qaas-server`'s job, at the layer that actually has
+//! the context to label them.
 
 pub mod admission;
 pub mod auth;
