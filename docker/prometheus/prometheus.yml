@@ -1,12 +1,15 @@
 # Local dev scrape config.
 #
-# qaas-server doesn't expose a /metrics endpoint yet — that lands in
-# feature/tracing-metrics (Phase 6). The qaas-server target below is
-# defined now, pointed at the port OpenTelemetry's Prometheus exporter
-# conventionally uses (9464), so Prometheus is already wired up and just
-# needs the endpoint to exist once that branch lands, instead of this
-# file being written from scratch then too. Until then this target will
-# show as "down" in Prometheus, which is expected, not a bug.
+# feature/tracing-metrics landed qaas-server's own /metrics endpoint via
+# metrics-exporter-prometheus's built-in HTTP listener - a plain
+# Prometheus text-format scrape target, no OpenTelemetry Collector or
+# OTLP involved on this path (that crate's own /metrics output is what's
+# scraped here directly; QAAS_OTEL_ENDPOINT, if ever set, is a *separate*
+# opt-in export of distributed traces, not metrics, to a collector this
+# dev stack doesn't run). It listens on QAAS_METRICS_ADDR
+# (docker-compose.yml sets this container's to 0.0.0.0:9090) - matching
+# that here, not the OpenTelemetry Collector's own conventional 9464,
+# which this project's exporter was never actually built to use.
 global:
   scrape_interval: 15s
 
@@ -17,4 +20,4 @@ scrape_configs:
 
   - job_name: qaas-server
     static_configs:
-      - targets: ["queue-node:9464"]
+      - targets: ["queue-node:9090"]

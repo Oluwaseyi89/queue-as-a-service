@@ -114,6 +114,10 @@
       <div class="label">Open queues / tenants</div>
       <div class="value" id="tile-counts">–</div>
     </div>
+    <div class="tile">
+      <div class="label">Audit events written / dropped</div>
+      <div class="value" id="tile-audit">–</div>
+    </div>
   </div>
 
   <section>
@@ -311,6 +315,14 @@ async function poll() {
   document.getElementById("tile-cost").textContent = fmtCost(totalCost);
   document.getElementById("tile-counts").textContent =
     fmtNum(snapshot.queues.length) + " / " + fmtNum(snapshot.tenants.length);
+
+  const auditTile = document.getElementById("tile-audit");
+  auditTile.textContent =
+    fmtNum(snapshot.audit_events_written) + " / " + fmtNum(snapshot.audit_events_dropped);
+  // Dropped audit events mean some enqueue/ack/nack calls have no
+  // compliance record at all - worth calling out, not just a number
+  // sitting quietly next to the others.
+  auditTile.style.color = snapshot.audit_events_dropped > 0 ? "var(--bad)" : "var(--text)";
 
   pushHistory("depth", totalDepth);
   pushHistory("dlq", totalDlq);

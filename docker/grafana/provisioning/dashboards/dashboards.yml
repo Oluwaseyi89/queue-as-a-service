@@ -1,9 +1,17 @@
 # Tells Grafana to auto-load any dashboard JSON file dropped into this
-# same directory on startup. No dashboards exist yet — building the
-# actual queue-depth/DLQ/token-spend dashboard is
-# feature/monitoring-dashboard's job (Phase 6). This provider config
-# exists now so that branch only has to add a JSON file here, not wire up
-# provisioning from scratch.
+# same directory on startup.
+#
+# Still empty by design, not by omission: feature/monitoring-dashboard
+# (Phase 6) built the queue-depth/DLQ/token-spend/top-agents dashboard
+# this directory originally anticipated, but as a standalone page
+# qaas-server itself serves directly (QAAS_DASHBOARD_ADDR, port 9091 in
+# this dev stack - see crates/qaas-server/src/dashboard.rs's own module
+# docs for the full reasoning: real-time polling and zero external
+# infrastructure, rather than a Grafana panel depending on this stack
+# being up at all). This provisioning slot is still live and still
+# useful for anyone who wants a *second*, Grafana-native view over the
+# same /metrics data feature/tracing-metrics exports - just not
+# something any branch has populated.
 apiVersion: 1
 
 providers:

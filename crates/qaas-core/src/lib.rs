@@ -170,8 +170,23 @@
 //! [`quota`] already hold; exporting spans and recording metrics with
 //! real labels is `qaas-server`'s job, at the layer that actually has
 //! the context to label them.
+//!
+//! `feature/structured-audit-logging` adds [`audit::AuditLogger`],
+//! porting global-rate-limiter's async, worker-pool-backed logger the
+//! same way [`circuit_breaker`] and [`admission`] already ported that
+//! project's breaker and limiter — see the module's own docs for the
+//! full design, including why "non-blocking" means the logger *drops*
+//! an event under real backpressure rather than making its caller wait,
+//! and why a worker pool commits out of order but every record still
+//! carries its own true logging time regardless. Generic over the event
+//! type, same as everything else in this crate that needs a caller to
+//! bring domain knowledge (`qaas-server` is where `enqueue`/`ack`/`nack`
+//! actually become audit events, at `feature/structured-audit-logging`'s
+//! own MCP-layer call sites) — this module still doesn't know what a
+//! tenant or a queue is either.
 
 pub mod admission;
+pub mod audit;
 pub mod auth;
 pub mod circuit_breaker;
 pub mod consumer_group;
@@ -184,6 +199,7 @@ pub mod semantic;
 pub mod wal;
 
 pub use admission::{AdmissionConfig, AdmissionController, AdmissionDecision, UsageSnapshot};
+pub use audit::{AuditLogger, AuditLoggerConfig};
 pub use auth::{ApiKeyStore, InvalidTenantId, TenantId};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitState, FallbackCache,
