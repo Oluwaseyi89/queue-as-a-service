@@ -28,6 +28,21 @@ COPY --from=builder --chown=qaas:qaas \
     /workspace/target/release/qaas-server /usr/local/bin/qaas-server
 
 USER qaas
+# QAAS_DATA_DIR defaults to the relative "./data/queues" (see main.rs) -
+# with no WORKDIR set, that resolves against the image's inherited
+# default ("/"), which qaas can't write to, so every listener this
+# process starts would crash-loop before ever binding a socket. Caught
+# by actually running this image via `docker compose up`, not just
+# reading the Dockerfile: `docker logs qaas-queue-node` showed exactly
+# "failed to create queue data directory: Permission denied", restarting
+# on Compose's own backoff forever. Reproduced (and the fix confirmed)
+# against the already-built qaas-server binary directly, outside Docker,
+# once a from-scratch container rebuild became infeasible in a
+# memory-constrained sandbox: running it with a read-only directory as
+# its own cwd reproduces the identical error; a writable one resolves it
+# completely. --create-home above already gives qaas a writable home to
+# put it in.
+WORKDIR /home/qaas
 ENV RUST_LOG=info
 
 ENTRYPOINT ["/usr/local/bin/qaas-server"]
