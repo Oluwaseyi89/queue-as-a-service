@@ -15,10 +15,44 @@ services:
     container_name: qaas-queue-node
     environment:
       RUST_LOG: info,qaas_server=debug
+      # qaas-server's own defaults (127.0.0.1) are loopback-only on
+      # purpose - see main.rs/telemetry.rs's own docs, the same
+      # "reachable from nowhere by default" stance every listener it
+      # binds takes. Inside a container that means unreachable even from
+      # sibling containers on the same Docker network, not just from the
+      # host - the `prometheus` service below scrapes this one by its
+      # Docker DNS name (`queue-node`), which only resolves to anything
+      # useful if this process is actually listening on an interface
+      # other than its own loopback. 0.0.0.0 here is still safely
+      # contained: nothing outside this compose network can reach these
+      # ports unless the port mappings below publish them to the host.
+      QAAS_HTTP_ADDR: "0.0.0.0:8080"
+      QAAS_METRICS_ADDR: "0.0.0.0:9090"
+      QAAS_DASHBOARD_ADDR: "0.0.0.0:9091"
+    ports:
+      # The MCP streamable-HTTP transport and the operator dashboard are
+      # meant to be reached directly (an agent runtime, a browser), so
+      # both get published to the host. The metrics port deliberately
+      # doesn't: only the `prometheus` service needs to reach it, over
+      # the Docker network by container name, and 9090 is already
+      # `prometheus`'s own published host port below - publishing this
+      # one too under the same number would collide.
+      - "8080:8080"
+      - "9091:9091"
+    # qaas-server's stdio MCP transport is its entrypoint's own stdin -
+    # without these, Compose gives that process no real stdin at all
+    # (closed immediately, same as piping from /dev/null), and stdio is
+    # the *only* place create_api_key can be called (see mcp.rs's own
+    # docs on why) - with neither of these set, there would be no way to
+    # mint the very API key the HTTP transport above requires. Attach to
+    # it with `docker compose -f docker/docker-compose.yml attach
+    # queue-node` once the stack is up (`just up-detached`, not the
+    # foreground `just up`, which interleaves every service's own
+    # stdout/stderr in one stream and isn't a usable place to type
+    # JSON-RPC).
+    stdin_open: true
+    tty: true
     restart: unless-stopped
-    # No ports published yet: qaas-server doesn't bind a socket until a
-    # network API lands (feature/mcp-server-interface and friends). Add
-    # the port mapping here once it does.
 
   prometheus:
     image: prom/prometheus:v3.14.0
