@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QaaS Dashboard</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #161a21;
+    --panel-border: #262c37;
+    --text: #e6e9ef;
+    --muted: #8b93a3;
+    --accent: #5eb0ff;
+    --warn: #f5a623;
+    --bad: #ef5b5b;
+    --good: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    padding-block: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  h1 span { color: var(--muted); font-weight: 400; }
+  #status { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); display: inline-block; }
+  #status.stale .dot { background: var(--bad); }
+
+  .tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .tile .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .tile .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+  .tile canvas { width: 100%; height: 36px; margin-top: 8px; display: block; }
+
+  section { margin-bottom: 28px; }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 14px; white-space: nowrap; }
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  tbody tr:not(:last-child) td { border-bottom: 1px solid var(--panel-border); }
+  tbody tr:hover { background: rgba(255,255,255,0.02); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { padding: 24px; text-align: center; color: var(--muted); }
+  .bar-cell { display: flex; align-items: center; gap: 8px; }
+  .bar-track { flex: 1; height: 6px; background: #232834; border-radius: 3px; overflow: hidden; min-width: 60px; }
+  .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+  .bar-fill.warn { background: var(--warn); }
+  .bar-fill.bad { background: var(--bad); }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #232834; color: var(--muted); }
+  .tag.stdio { color: var(--muted); }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Queue-as-a-Service <span>· operator dashboard</span></h1>
+    <div id="status"><span class="dot"></span><span id="status-text">connecting…</span></div>
+  </header>
+
+  <div class="tiles">
+    <div class="tile">
+      <div class="label">Total depth</div>
+      <div class="value" id="tile-depth">–</div>
+      <canvas id="chart-depth"></canvas>
+    </div>
+    <div class="tile">
+      <div class="label">Dead letters</div>
+      <div class="value" id="tile-dlq">–</div>
+      <canvas id="chart-dlq"></canvas>
+    </div>
+    <div class="tile">
+      <div class="label">Cost spend (window)</div>
+      <div class="value" id="tile-cost">–</div>
+      <canvas id="chart-cost"></canvas>
+    </div>
+    <div class="tile">
+      <div class="label">Open queues / tenants</div>
+      <div class="value" id="tile-counts">–</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Queues</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Tenant</th>
+            <th>Queue</th>
+            <th class="num">Depth</th>
+            <th class="num">Oldest pending</th>
+            <th class="num">Dead letters</th>
+            <th>Token budget</th>
+            <th>Cost budget</th>
+          </tr>
+        </thead>
+        <tbody id="queues-body"></tbody>
+      </table>
+      <div class="empty" id="queues-empty" hidden>No queues open yet — enqueue a message to see it here.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Top agents (tenants)</h2>
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Tenant</th>
+            <th class="num">Queues</th>
+            <th class="num">Pending messages</th>
+            <th>Requests (window)</th>
+          </tr>
+        </thead>
+        <tbody id="tenants-body"></tbody>
+      </table>
+      <div class="empty" id="tenants-empty" hidden>No authenticated tenants active yet.</div>
+    </div>
+  </section>
+
+<script>
+"use strict";
+
+// Client-side history only — this server keeps no time-series storage
+// of its own (see dashboard.rs's own docs for why); a trend is whatever
+// this one open tab has personally observed since it loaded, not
+// something a second viewer or a page reload can recover. That's a
+// deliberate, honest scope cut for a first dashboard, not an oversight.
+const HISTORY_LEN = 60; // 2 minutes at the 2s poll interval below
+const POLL_MS = 2000;
+
+const history = { depth: [], dlq: [], cost: [] };
+
+function pushHistory(key, value) {
+  const arr = history[key];
+  arr.push(value);
+  if (arr.length > HISTORY_LEN) arr.shift();
+}
+
+function drawSparkline(canvas, values, color) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(rect.width, 1);
+  const h = Math.max(rect.height, 1);
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (values.length < 2) return;
+
+  const max = Math.max(...values, 1);
+  const min = Math.min(...values, 0);
+  const range = max - min || 1;
+  const step = w / (HISTORY_LEN - 1);
+  const offset = HISTORY_LEN - values.length;
+
+  ctx.beginPath();
+  values.forEach((v, i) => {
+    const x = (offset + i) * step;
+    const y = h - ((v - min) / range) * (h - 4) - 2;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function fmtNum(n) {
+  return new Intl.NumberFormat().format(n);
+}
+
+function fmtSeconds(s) {
+  if (s < 1) return Math.round(s * 1000) + "ms";
+  if (s < 60) return s.toFixed(1) + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  return Math.round(s / 3600) + "h";
+}
+
+function fmtCost(c) {
+  return "$" + c.toFixed(4);
+}
+
+function budgetCell(used, limit, fmt) {
+  if (limit == null) {
+    return `<span class="tag">${fmt(used)} · unlimited</span>`;
+  }
+  const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 100;
+  const cls = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
+  return `
+    <div class="bar-cell">
+      <span>${fmt(used)} / ${fmt(limit)}</span>
+      <span class="bar-track"><span class="bar-fill ${cls}" style="width:${pct}%"></span></span>
+    </div>`;
+}
+
+function renderQueues(queues) {
+  const body = document.getElementById("queues-body");
+  const empty = document.getElementById("queues-empty");
+  if (queues.length === 0) {
+    body.innerHTML = "";
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  const sorted = [...queues].sort((a, b) => b.depth - a.depth);
+  body.innerHTML = sorted.map(q => `
+    <tr>
+      <td>${q.tenant === "none" ? '<span class="tag stdio">stdio</span>' : escapeHtml(q.tenant)}</td>
+      <td>${escapeHtml(q.queue)}</td>
+      <td class="num">${fmtNum(q.depth)}</td>
+      <td class="num">${fmtSeconds(q.oldest_pending_age_seconds)}</td>
+      <td class="num">${fmtNum(q.dead_letters)}</td>
+      <td>${budgetCell(q.tokens_used, q.tokens_per_window, fmtNum)}</td>
+      <td>${budgetCell(q.cost_used, q.cost_ceiling_per_window, fmtCost)}</td>
+    </tr>
+  `).join("");
+}
+
+function renderTenants(tenants) {
+  const body = document.getElementById("tenants-body");
+  const empty = document.getElementById("tenants-empty");
+  if (tenants.length === 0) {
+    body.innerHTML = "";
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+
+  const sorted = [...tenants].sort((a, b) => b.pending_messages - a.pending_messages);
+  body.innerHTML = sorted.map(t => `
+    <tr>
+      <td>${escapeHtml(t.tenant)}</td>
+      <td class="num">${fmtNum(t.queues_open)}</td>
+      <td class="num">${fmtNum(t.pending_messages)}</td>
+      <td>${budgetCell(t.requests_in_window, t.requests_per_window, fmtNum)}</td>
+    </tr>
+  `).join("");
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function setStatus(ok, text) {
+  const el = document.getElementById("status");
+  const label = document.getElementById("status-text");
+  el.classList.toggle("stale", !ok);
+  label.textContent = text;
+}
+
+async function poll() {
+  let snapshot;
+  try {
+    const res = await fetch("/api/snapshot", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    snapshot = await res.json();
+  } catch (err) {
+    setStatus(false, "connection lost — retrying…");
+    return;
+  }
+
+  setStatus(true, "updated " + new Date(snapshot.generated_at_ms).toLocaleTimeString());
+
+  const totalDepth = snapshot.queues.reduce((sum, q) => sum + q.depth, 0);
+  const totalDlq = snapshot.queues.reduce((sum, q) => sum + q.dead_letters, 0);
+  const totalCost = snapshot.queues.reduce((sum, q) => sum + q.cost_used, 0);
+
+  document.getElementById("tile-depth").textContent = fmtNum(totalDepth);
+  document.getElementById("tile-dlq").textContent = fmtNum(totalDlq);
+  document.getElementById("tile-cost").textContent = fmtCost(totalCost);
+  document.getElementById("tile-counts").textContent =
+    fmtNum(snapshot.queues.length) + " / " + fmtNum(snapshot.tenants.length);
+
+  pushHistory("depth", totalDepth);
+  pushHistory("dlq", totalDlq);
+  pushHistory("cost", totalCost);
+  drawSparkline(document.getElementById("chart-depth"), history.depth, "#5eb0ff");
+  drawSparkline(document.getElementById("chart-dlq"), history.dlq, "#ef5b5b");
+  drawSparkline(document.getElementById("chart-cost"), history.cost, "#3ecf8e");
+
+  renderQueues(snapshot.queues);
+  renderTenants(snapshot.tenants);
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
