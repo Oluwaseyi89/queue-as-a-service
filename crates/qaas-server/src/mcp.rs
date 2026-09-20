@@ -774,6 +774,182 @@ impl QueueRegistry {
         }
         total
     }
+
+    /// The inverse of [`Self::scope_key`] — splits a key this registry
+    /// itself produced back into its tenant label (`"none"` for the
+    /// trusted stdio connection, matching [`tenant_label`]) and queue
+    /// name. Only the dashboard snapshot needs this: every other method
+    /// here already knows the tenant/name it's looking a key up *for*;
+    /// this one has to enumerate every open queue and recover both
+    /// halves from keys alone. Safe because `scope_key` only ever uses
+    /// `\0` as a separator and neither half can ever contain one
+    /// (`TenantId` and a validated queue name are both restricted to
+    /// `[A-Za-z0-9_-]`).
+    fn split_scope_key(key: &str) -> (String, String) {
+        match key.split_once('\0') {
+            Some((tenant, queue)) => (tenant.to_string(), queue.to_string()),
+            None => ("none".to_string(), key.to_string()),
+        }
+    }
+
+    /// Every currently-open queue's live status — depth, consumer lag,
+    /// dead-letter count, and admission usage/ceiling if one is
+    /// configured — gathered in one pass rather than one round trip per
+    /// queue per field. `feature/monitoring-dashboard`'s only reader.
+    async fn queue_snapshots(&self) -> Vec<QueueStatus> {
+        let matching: Vec<(String, Arc<ConsumerGroup<serde_json::Value>>)> = {
+            let groups = self.groups.lock().await;
+            groups.iter().map(|(key, group)| (key.clone(), Arc::clone(group))).collect()
+        };
+
+        let mut statuses = Vec::with_capacity(matching.len());
+        for (key, group) in matching {
+            let (tenant, queue) = Self::split_scope_key(&key);
+            let depth = group.len().await;
+            let oldest_pending_age_seconds =
+                group.oldest_pending_age().await.map_or(0.0, |age| age.as_secs_f64());
+            let dead_letters = group.dead_letters().await.len();
+
+            let (tokens_used, tokens_per_window, cost_used, cost_ceiling_per_window) = {
+                let controllers = self.admission.lock().await;
+                if let Some(controller) = controllers.get(&key) {
+                    let usage = controller.usage().await;
+                    let config = controller.config().await;
+                    (
+                        usage.tokens_used,
+                        config.tokens_per_window,
+                        usage.cost_used,
+                        config.cost_ceiling_per_window,
+                    )
+                } else {
+                    (0, None, 0.0, None)
+                }
+            };
+
+            statuses.push(QueueStatus {
+                tenant,
+                queue,
+                depth,
+                oldest_pending_age_seconds,
+                dead_letters,
+                tokens_used,
+                tokens_per_window,
+                cost_used,
+                cost_ceiling_per_window,
+            });
+        }
+        statuses
+    }
+
+    /// Every tenant with at least one open queue, joined with its quota
+    /// configuration and live usage — `feature/monitoring-dashboard`'s
+    /// "top agents" data. Derived from `groups`' own keys rather than
+    /// `tenant_quotas`, deliberately: a tenant only ever gets a
+    /// `tenant_quotas` entry via [`Self::quota`], which every real
+    /// `authorize` call makes — but this module's own tests call
+    /// `*_impl` methods directly, bypassing `authorize` entirely, and a
+    /// tenant with genuinely open queues should never silently vanish
+    /// from this list just because of *how* it got there. The trusted
+    /// stdio connection never appears here: it isn't a tenant, and a
+    /// leaderboard of isolated, authenticated callers has no meaningful
+    /// entry for the one caller isolation doesn't even apply to.
+    async fn tenant_snapshots(&self) -> Vec<TenantStatus> {
+        let tenant_labels: std::collections::BTreeSet<String> = {
+            let groups = self.groups.lock().await;
+            groups
+                .keys()
+                .filter_map(|key| key.split_once('\0').map(|(tenant, _)| tenant.to_string()))
+                .collect()
+        };
+
+        let mut statuses = Vec::with_capacity(tenant_labels.len());
+        for tenant_id in tenant_labels {
+            // Every label here came from a real scope_key this registry
+            // itself produced from an already-validated TenantId - this
+            // can only fail if that invariant is somehow broken, which a
+            // read-only dashboard snapshot is not the place to silently
+            // paper over.
+            let tenant = TenantId::new(&tenant_id)
+                .expect("tenant label recovered from an existing scope_key must itself be valid");
+            let quota = self.quota(&tenant).await;
+            let config = quota.config().await;
+            let requests_in_window = quota.requests_in_window().await;
+            let queues_open = self.tenant_queue_count(&tenant).await;
+            let pending_messages = self.tenant_pending_total(&tenant).await;
+            statuses.push(TenantStatus {
+                tenant: tenant_id,
+                queues_open,
+                pending_messages,
+                requests_in_window,
+                requests_per_window: config.requests_per_window,
+            });
+        }
+        statuses
+    }
+}
+
+/// One queue's live status — see [`QueueRegistry::queue_snapshots`].
+/// Public so `crate::dashboard`'s read-only analytics API can serialize
+/// it directly, without that module needing any knowledge of tenants or
+/// queues itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueStatus {
+    /// `"none"` for the trusted stdio connection, matching
+    /// [`tenant_label`] — the dashboard's own "agent" axis.
+    pub tenant: String,
+    /// The queue's name, unique only within `tenant`.
+    pub queue: String,
+    /// Unacknowledged messages — pending, leased, or delayed.
+    pub depth: usize,
+    /// How long the oldest still-claimable message has been waiting.
+    /// `0.0` if nothing is currently pending — see
+    /// [`qaas_core::ConsumerGroup::oldest_pending_age`].
+    pub oldest_pending_age_seconds: f64,
+    /// Messages currently sitting in this queue's dead-letter queue.
+    pub dead_letters: usize,
+    /// Tokens admitted within the current admission window. `0` if no
+    /// admission budget has ever been configured for this queue.
+    pub tokens_used: u64,
+    /// The configured token ceiling, if any.
+    pub tokens_per_window: Option<u64>,
+    /// Dollars admitted within the current admission window.
+    pub cost_used: f64,
+    /// The configured cost ceiling, if any.
+    pub cost_ceiling_per_window: Option<f64>,
+}
+
+/// One tenant's live status — see [`QueueRegistry::tenant_snapshots`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantStatus {
+    /// The tenant id.
+    pub tenant: String,
+    /// How many queues this tenant currently has open.
+    pub queues_open: usize,
+    /// Total unacknowledged messages across all of them.
+    pub pending_messages: u64,
+    /// Tool calls this tenant has made within the current rate-limit
+    /// window.
+    pub requests_in_window: u64,
+    /// The configured request-rate ceiling, if any.
+    pub requests_per_window: Option<u64>,
+}
+
+/// A full point-in-time snapshot of every currently-open queue and every
+/// tenant with at least one — `crate::dashboard`'s entire data model.
+/// Assembled fresh on every request; nothing here is cached or sampled
+/// on a timer, so two requests a second apart can legitimately disagree
+/// with each other the same way two `admission_status` calls can.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    /// When this snapshot was assembled, in milliseconds since the Unix
+    /// epoch — lets a client detect a stalled poll loop even if the
+    /// underlying data hasn't changed.
+    pub generated_at_ms: u64,
+    /// Every currently-open queue, in no particular order — sorting is
+    /// the dashboard UI's job, not this API's.
+    pub queues: Vec<QueueStatus>,
+    /// Every tenant with at least one open queue.
+    pub tenants: Vec<TenantStatus>,
 }
 
 /// Arguments for the `enqueue` tool.
@@ -1407,6 +1583,19 @@ impl QaasMcpServer {
         let data_dir = data_dir.into();
         let api_keys = ApiKeyStore::open(data_dir.join("api_keys.log")).await?;
         Ok(Self { registry: Arc::new(QueueRegistry::new(data_dir)), api_keys: Arc::new(api_keys) })
+    }
+
+    /// A full point-in-time [`DashboardSnapshot`] — the only thing
+    /// `crate::dashboard`'s read-only analytics API needs from this
+    /// server, keeping every bit of tenant/queue knowledge on this side
+    /// of the module boundary. Not a `#[tool]`: this isn't reachable
+    /// over MCP at all, only from `dashboard`'s own HTTP handlers.
+    pub async fn dashboard_snapshot(&self) -> DashboardSnapshot {
+        DashboardSnapshot {
+            generated_at_ms: qaas_types::Timestamp::now().0,
+            queues: self.registry.queue_snapshots().await,
+            tenants: self.registry.tenant_snapshots().await,
+        }
     }
 
     /// The single entry point every tool method uses instead of calling
@@ -4252,5 +4441,105 @@ mod tests {
             ),
             Some(DebugValue::Gauge(2.0.into())),
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_is_empty_for_a_fresh_server() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        let snapshot = server.dashboard_snapshot().await;
+        assert!(snapshot.queues.is_empty());
+        assert!(snapshot.tenants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_reports_stdio_queues_under_the_none_tenant() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+
+        server.enqueue_impl(None, enqueue_params("orders", json!("a"))).await.unwrap();
+        server.enqueue_impl(None, enqueue_params("orders", json!("b"))).await.unwrap();
+
+        let snapshot = server.dashboard_snapshot().await;
+        assert_eq!(snapshot.queues.len(), 1);
+        let queue = &snapshot.queues[0];
+        assert_eq!(queue.tenant, "none");
+        assert_eq!(queue.queue, "orders");
+        assert_eq!(queue.depth, 2);
+        assert_eq!(queue.dead_letters, 0);
+
+        // stdio never appears as a "tenant" in the leaderboard.
+        assert!(snapshot.tenants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_reports_a_tenant_with_open_queues_even_without_going_through_authorize()
+     {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        // Deliberately calls *_impl directly, the same way every other
+        // test in this module does, bypassing authorize (and therefore
+        // QueueRegistry::quota) entirely - tenant_snapshots must still
+        // find this tenant via its open queues, not just via a
+        // tenant_quotas entry authorize would otherwise have created.
+        server
+            .enqueue_impl(Some(tenant.clone()), enqueue_params("orders", json!("a")))
+            .await
+            .unwrap();
+        server.enqueue_impl(Some(tenant), enqueue_params("support", json!("b"))).await.unwrap();
+
+        let snapshot = server.dashboard_snapshot().await;
+        assert_eq!(snapshot.queues.len(), 2);
+        assert!(snapshot.queues.iter().all(|q| q.tenant == "tenant-a"));
+
+        assert_eq!(snapshot.tenants.len(), 1);
+        let tenant_status = &snapshot.tenants[0];
+        assert_eq!(tenant_status.tenant, "tenant-a");
+        assert_eq!(tenant_status.queues_open, 2);
+        assert_eq!(tenant_status.pending_messages, 2);
+        assert_eq!(tenant_status.requests_in_window, 0);
+        assert_eq!(tenant_status.requests_per_window, None);
+    }
+
+    #[tokio::test]
+    async fn dashboard_snapshot_reports_admission_usage_and_dead_letters() {
+        let dir = tempdir().unwrap();
+        let server = server(&dir).await;
+        let tenant = TenantId::new("tenant-a").unwrap();
+
+        server
+            .configure_admission_impl(
+                Some(tenant.clone()),
+                super::ConfigureAdmissionParams {
+                    queue: "orders".to_string(),
+                    tokens_per_window: Some(1000),
+                    cost_ceiling_per_window: Some(5.0),
+                    window_seconds: None,
+                },
+            )
+            .await
+            .unwrap();
+        server
+            .enqueue_impl(
+                Some(tenant),
+                super::EnqueueParams {
+                    estimated_tokens: Some(100),
+                    estimated_cost: Some(1.5),
+                    ..enqueue_params("orders", json!("a"))
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = server.dashboard_snapshot().await;
+        let queue = &snapshot.queues[0];
+        assert_eq!(queue.tokens_used, 100);
+        assert_eq!(queue.tokens_per_window, Some(1000));
+        assert!((queue.cost_used - 1.5).abs() < f64::EPSILON);
+        assert_eq!(queue.cost_ceiling_per_window, Some(5.0));
+        assert_eq!(queue.dead_letters, 0);
     }
 }

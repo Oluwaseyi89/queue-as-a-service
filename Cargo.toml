@@ -33,7 +33,7 @@ openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 rmcp = { version = "3", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
 sha2 = "0.10"
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 http = "1"
 jsonwebtoken = "9"
 tower = { version = "0.5", default-features = false, features = ["util"] }
