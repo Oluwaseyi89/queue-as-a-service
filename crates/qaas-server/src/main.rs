@@ -43,7 +43,15 @@
 //! `tracing_subscriber::fmt().init()` this file used to call directly —
 //! same stderr-writing behavior, now also wired to export spans via
 //! `OpenTelemetry` if `QAAS_OTEL_ENDPOINT` is set.
+//!
+//! # `feature/monitoring-dashboard`: a fourth listener, same reasoning
+//!
+//! [`dashboard::serve`] starts the operator dashboard on its own
+//! address (`QAAS_DASHBOARD_ADDR`) for the identical reason
+//! `feature/tracing-metrics` gave `/metrics` its own listener rather
+//! than a route on [`serve_http`]'s — see `dashboard`'s own module docs.
 
+mod dashboard;
 mod http_auth;
 mod mcp;
 mod telemetry;
@@ -64,6 +72,14 @@ const DEFAULT_DATA_DIR: &str = "./data/queues";
 /// `QAAS_HTTP_ADDR`. Loopback-only by default — see the module docs on
 /// why that's a deliberate default rather than `0.0.0.0`.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+
+/// Where the operator dashboard listens, overridable via
+/// `QAAS_DASHBOARD_ADDR`. Loopback-only by default, and yet another port
+/// from every other listener this process binds, for the same reason
+/// `telemetry::DEFAULT_METRICS_ADDR` picked its own: running more than
+/// one of these listeners with only `QAAS_HTTP_ADDR` overridden must
+/// never silently collide.
+const DEFAULT_DASHBOARD_ADDR: &str = "127.0.0.1:9091";
 
 #[tokio::main]
 async fn main() {
@@ -106,6 +122,22 @@ async fn main() {
             tracing::error!(%error, %http_addr, "streamable-HTTP MCP server failed");
         }
     });
+
+    let dashboard_addr =
+        std::env::var("QAAS_DASHBOARD_ADDR").unwrap_or_else(|_| DEFAULT_DASHBOARD_ADDR.to_string());
+    match dashboard_addr.parse() {
+        Ok(addr) => {
+            let dashboard_server = server.clone();
+            tokio::spawn(async move {
+                if let Err(error) = dashboard::serve(dashboard_server, addr).await {
+                    tracing::error!(%error, %dashboard_addr, "operator dashboard failed");
+                }
+            });
+        }
+        Err(error) => {
+            tracing::error!(%error, %dashboard_addr, "QAAS_DASHBOARD_ADDR is not a valid address");
+        }
+    }
 
     tracing::info!("starting QaaS MCP server over stdio");
     let running = match server.serve(rmcp::transport::stdio()).await {
