@@ -1416,6 +1416,74 @@ mod tests {
         assert_eq!(redelivered.checkpoint, Some(legitimate));
     }
 
+    /// The test above covers a lease that's already *fully* expired and
+    /// redelivered by the time `checkpoint` is even called - purely
+    /// sequential, no real race. This one forces the actual race
+    /// `checkpoint`'s own doc comment describes: the lease is still
+    /// checked-and-found-valid at the start of the call, expires while
+    /// the (fsync-backed, tens-of-milliseconds) WAL write for it is still
+    /// in flight, and gets reclaimed by another caller before the second,
+    /// post-write check runs. A visibility timeout of 1ms guarantees the
+    /// lease has already expired by the time *anything* scheduled after
+    /// it gets to run — including the reclaiming `claim()` below, fired
+    /// a few milliseconds in, which is still comfortably before a real
+    /// fsync on this machine (consistently 40-50ms, measured empirically
+    /// for `feature/structured-audit-logging`'s own WAL-latency work)
+    /// completes. That ordering is what makes this deterministic rather
+    /// than a hope: the reclaim is virtually certain to land while
+    /// `checkpoint`'s write is still outstanding, not before or after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn checkpoint_racing_a_lease_expiry_is_durable_even_when_it_loses() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let group = Arc::new(
+            ConsumerGroup::<i32>::open(&path, Duration::from_millis(1), NO_RETRY_DELAY)
+                .await
+                .unwrap(),
+        );
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        let progress = serde_json::json!({"step": "mid-flight"});
+        let checkpoint_task = {
+            let group = Arc::clone(&group);
+            let progress = progress.clone();
+            tokio::spawn(async move { group.checkpoint(claim.id, claim.token, progress).await })
+        };
+
+        // The 1ms visibility timeout above has already elapsed long
+        // before this sleep even returns - this reclaim is racing
+        // `checkpoint`'s in-flight WAL write, not its already-finished
+        // one.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let redelivered = group.claim().await;
+        assert_eq!(
+            redelivered.id, claim.id,
+            "the same message, reclaimed out from under checkpoint"
+        );
+
+        let checkpoint_result = checkpoint_task.await.unwrap().unwrap();
+        assert!(
+            !checkpoint_result,
+            "the lease was already reclaimed; this must be reported honestly"
+        );
+
+        // The live in-memory lease no longer reflects it (that's what
+        // `false` just confirmed), but the write itself landed - a
+        // restart must still see it, exactly as `checkpoint`'s own doc
+        // comment promises.
+        drop(group);
+        let reopened =
+            ConsumerGroup::<i32>::open(&path, LONG_TIMEOUT, NO_RETRY_DELAY).await.unwrap();
+        let after_restart = reopened.claim().await;
+        assert_eq!(after_restart.id, claim.id);
+        assert_eq!(
+            after_restart.checkpoint,
+            Some(progress),
+            "a checkpoint that lost its race must still be durable"
+        );
+    }
+
     #[tokio::test]
     async fn published_chunks_are_returned_in_order_with_increasing_sequence_numbers() {
         let dir = tempdir().unwrap();
@@ -1499,6 +1567,49 @@ mod tests {
             panic!("expected chunks");
         };
         assert_eq!(chunks[0].data, serde_json::json!("finally"));
+    }
+
+    /// `publish_partial_result`'s own doc comment already claims this
+    /// ("wake all of them to recheck") as the reason it calls
+    /// `notify_waiters` instead of `notify_one` — easy to get backwards
+    /// without noticing, since `notify_one` would still pass every
+    /// *single*-watcher test above. Pins the actual multi-watcher claim
+    /// down directly: if this ever regressed to `notify_one`, only one of
+    /// the three watchers below would ever wake, and the other two would
+    /// hang until the outer `timeout` fails the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multiple_concurrent_watchers_all_see_a_published_chunk() {
+        let dir = tempdir().unwrap();
+        let group = Arc::new(open(&dir, LONG_TIMEOUT).await);
+        group.enqueue(1).await.unwrap();
+        let claim = group.claim().await;
+
+        let mut watchers = Vec::new();
+        for _ in 0..3 {
+            let group = Arc::clone(&group);
+            watchers
+                .push(tokio::spawn(async move { group.partial_results_since(claim.id, 0).await }));
+        }
+
+        // Same reasoning as the single-watcher test above: give every
+        // watcher a real chance to actually be blocked in
+        // `.notified().await` first.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        group
+            .publish_partial_result(claim.id, claim.token, serde_json::json!("broadcast"), true)
+            .await
+            .unwrap();
+
+        for watcher in watchers {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), watcher)
+                .await
+                .expect("every watcher should have woken up, not just one")
+                .unwrap();
+            let PartialResultsPoll::Chunks(chunks) = outcome else {
+                panic!("expected chunks");
+            };
+            assert_eq!(chunks[0].data, serde_json::json!("broadcast"));
+        }
     }
 
     #[tokio::test]
@@ -2074,6 +2185,49 @@ mod tests {
 
         assert!(!group.reprocess_dead_letter(bogus_id).await.unwrap());
         assert!(!group.purge_dead_letter(bogus_id).await.unwrap());
+    }
+
+    /// Both methods start with the same
+    /// [`DeadLetterQueue::take`](crate::dead_letter::DeadLetterQueue::take)
+    /// call, which is what actually decides the race: whichever caller's
+    /// `take` runs first gets `Some` and proceeds, the other gets `None`
+    /// and reports `Ok(false)` without touching anything else. Worth
+    /// pinning down directly rather than trusting that by inspection
+    /// alone - "reprocess and purge are mutually exclusive outcomes for
+    /// the same dead letter" is exactly the kind of invariant that's
+    /// obvious from reading the code today and silent the day someone
+    /// changes `take`'s locking without realizing this depends on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reprocess_and_purge_of_the_same_dead_letter_resolve_exactly_once() {
+        let dir = tempdir().unwrap();
+        let group = Arc::new(
+            ConsumerGroup::<i32>::open(dir.path().join("wal.log"), LONG_TIMEOUT, EXHAUST_AFTER_TWO)
+                .await
+                .unwrap(),
+        );
+        group.enqueue(1).await.unwrap();
+        let first = group.claim().await;
+        group.nack(first.id, first.token, None).await.unwrap();
+        let second = group.claim().await;
+        group.nack(second.id, second.token, None).await.unwrap();
+        assert_eq!(group.dead_letters().await.len(), 1);
+
+        let reprocess_group = Arc::clone(&group);
+        let reprocess =
+            tokio::spawn(async move { reprocess_group.reprocess_dead_letter(first.id).await });
+        let purge_group = Arc::clone(&group);
+        let purge = tokio::spawn(async move { purge_group.purge_dead_letter(first.id).await });
+
+        let reprocessed = reprocess.await.unwrap().unwrap();
+        let purged = purge.await.unwrap().unwrap();
+        assert_ne!(reprocessed, purged, "exactly one of the two must have won the race");
+        assert!(group.dead_letters().await.is_empty(), "the dead letter must be gone either way");
+
+        if reprocessed {
+            assert_eq!(group.len().await, 1, "the winning reprocess must have re-enqueued it");
+        } else {
+            assert!(group.is_empty().await, "the winning purge must leave nothing behind");
+        }
     }
 
     fn key(s: &str) -> qaas_types::IdempotencyKey {
