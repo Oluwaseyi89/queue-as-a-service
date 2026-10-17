@@ -102,6 +102,8 @@ impl<T: Serialize + DeserializeOwned> PersistentPriorityQueue<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::tempdir;
 
     use super::PersistentPriorityQueue;
@@ -137,5 +139,52 @@ mod tests {
         assert_eq!(recovered.len().await, 2);
         assert_eq!(recovered.dequeue().await.unwrap(), "first-low");
         assert_eq!(recovered.dequeue().await.unwrap(), "second-low");
+    }
+
+    /// See [`PersistentFifoQueue`](super::super::PersistentFifoQueue)'s
+    /// own
+    /// `concurrent_producers_are_never_lost_or_duplicated_by_a_crash_replay`
+    /// for why this checks presence, not ordering: `enqueue` here is the
+    /// same two-separate-locks shape (the WAL's writer lock, then the
+    /// inner queue's), so concurrent producers can land their WAL records
+    /// and their in-memory pushes in different relative orders - never a
+    /// promised guarantee to begin with - without that being a bug. Loss
+    /// or duplication across a crash would be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_producers_are_never_lost_or_duplicated_by_a_crash_replay() {
+        const PRODUCERS: usize = 50;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let queue = Arc::new(PersistentPriorityQueue::<usize>::open(&path).await.unwrap());
+
+        let mut tasks = Vec::new();
+        for i in 0..PRODUCERS {
+            let queue = Arc::clone(&queue);
+            tasks.push(tokio::spawn(async move {
+                queue.enqueue(i, Priority(u8::try_from(i % 4).unwrap())).await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(queue.len().await, PRODUCERS, "the live queue lost or duplicated an item");
+
+        // Simulate a crash with nothing dequeued yet - see the FIFO
+        // version's own comment for why draining first would contaminate
+        // the WAL with Dequeue records before the "crash" point.
+        drop(queue);
+
+        let replayed = PersistentPriorityQueue::<usize>::open(&path).await.unwrap();
+        let mut replayed_items = Vec::new();
+        while !replayed.is_empty().await {
+            replayed_items.push(replayed.dequeue().await.unwrap());
+        }
+
+        replayed_items.sort_unstable();
+        assert_eq!(
+            replayed_items,
+            (0..PRODUCERS).collect::<Vec<_>>(),
+            "WAL replay lost or duplicated an item"
+        );
     }
 }
