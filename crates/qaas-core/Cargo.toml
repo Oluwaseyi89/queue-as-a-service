@@ -28,3 +28,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+loom.workspace = true
