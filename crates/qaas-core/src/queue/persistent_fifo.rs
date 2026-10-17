@@ -131,9 +131,63 @@ impl<T: Serialize + DeserializeOwned> PersistentFifoQueue<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tempfile::tempdir;
 
     use super::PersistentFifoQueue;
+
+    /// `enqueue` is two separate steps — a WAL write, then a push into the
+    /// in-memory [`FifoQueue`] — guarded by two *different* locks (the
+    /// `Wal`'s own writer lock, and the inner queue's), not one lock
+    /// spanning both. That's never a correctness problem for a single
+    /// caller (the WAL write already happened by the time the in-memory
+    /// push runs), but it does mean concurrent producers can land their
+    /// WAL records in a different relative order than their in-memory
+    /// pushes - nothing here claims a cross-task ordering guarantee among
+    /// logically-concurrent enqueues (there's no inherent order to keep
+    /// among calls with no happens-before relationship to each other), so
+    /// that reordering itself is fine. What would *not* be fine is losing
+    /// or duplicating an item across it. This pins that down under real
+    /// contention rather than trusting the two-separate-locks reasoning
+    /// above by inspection alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_producers_are_never_lost_or_duplicated_by_a_crash_replay() {
+        const PRODUCERS: usize = 50;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let queue = Arc::new(PersistentFifoQueue::<usize>::open(&path).await.unwrap());
+
+        let mut tasks = Vec::new();
+        for i in 0..PRODUCERS {
+            let queue = Arc::clone(&queue);
+            tasks.push(tokio::spawn(async move { queue.enqueue(i).await.unwrap() }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(queue.len().await, PRODUCERS, "the live queue lost or duplicated an item");
+
+        // Drop without dequeuing anything, simulating a crash with every
+        // concurrently-enqueued item still pending - draining first would
+        // durably log Dequeue records too, which is a different scenario
+        // (and one the sequential round-trip test above already covers).
+        drop(queue);
+
+        let replayed = PersistentFifoQueue::<usize>::open(&path).await.unwrap();
+        let mut replay_order = Vec::new();
+        while !replayed.is_empty().await {
+            replay_order.push(replayed.dequeue().await.unwrap());
+        }
+
+        let mut replay_sorted = replay_order.clone();
+        replay_sorted.sort_unstable();
+        assert_eq!(
+            replay_sorted,
+            (0..PRODUCERS).collect::<Vec<_>>(),
+            "WAL replay lost or duplicated an item"
+        );
+    }
 
     #[tokio::test]
     async fn enqueue_then_dequeue_round_trips_in_fifo_order() {
