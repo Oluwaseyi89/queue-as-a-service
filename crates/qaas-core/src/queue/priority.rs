@@ -277,4 +277,71 @@ mod tests {
         enqueue_task.await.unwrap();
         assert_eq!(queue.dequeue().await, 2);
     }
+
+    /// Mirrors [`FifoQueue`](super::super::FifoQueue)'s own
+    /// `concurrent_producers_and_consumers_deliver_every_item_exactly_once`
+    /// test: same shared-counter claiming trick so consumer tasks don't
+    /// deadlock waiting for a personal share of a pool nobody guaranteed
+    /// them, same reason for existing (the sequential dequeue-order tests
+    /// above only exercise `items`' `Mutex` one caller at a time - this is
+    /// the one that actually contends it). Priority is deliberately
+    /// irrelevant to what's asserted: every item still enqueued exactly
+    /// once is independent of *which* priority queue type does the
+    /// enqueuing, so this only checks for lost or duplicated items, not
+    /// ordering (equal-priority FIFO-among-ties is already covered,
+    /// single-threaded, above).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_producers_and_consumers_deliver_every_item_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const PRODUCERS: usize = 4;
+        const ITEMS_PER_PRODUCER: usize = 200;
+        const TOTAL_ITEMS: usize = PRODUCERS * ITEMS_PER_PRODUCER;
+
+        let queue = Arc::new(PriorityQueue::bounded(NonZeroUsize::new(8).unwrap()));
+
+        let mut producers = Vec::new();
+        for producer_id in 0..PRODUCERS {
+            let queue = Arc::clone(&queue);
+            producers.push(tokio::spawn(async move {
+                for i in 0..ITEMS_PER_PRODUCER {
+                    let item = producer_id * ITEMS_PER_PRODUCER + i;
+                    // Priority cycles through a few values so producers
+                    // genuinely contend on heap reordering, not just on
+                    // the mutex around a FIFO-equivalent structure.
+                    queue.enqueue(item, Priority(u8::try_from(item % 4).unwrap())).await;
+                }
+            }));
+        }
+
+        let remaining = Arc::new(AtomicUsize::new(TOTAL_ITEMS));
+        let mut consumers = Vec::new();
+        for _ in 0..3 {
+            let queue = Arc::clone(&queue);
+            let remaining = Arc::clone(&remaining);
+            consumers.push(tokio::spawn(async move {
+                let mut received = Vec::new();
+                while remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n - 1))
+                    .is_ok()
+                {
+                    received.push(queue.dequeue().await);
+                }
+                received
+            }));
+        }
+
+        for producer in producers {
+            producer.await.unwrap();
+        }
+
+        let mut all_received = Vec::new();
+        for consumer in consumers {
+            all_received.extend(consumer.await.unwrap());
+        }
+
+        all_received.sort_unstable();
+        let expected: Vec<usize> = (0..TOTAL_ITEMS).collect();
+        assert_eq!(all_received, expected);
+    }
 }
