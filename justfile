@@ -7,6 +7,14 @@
 # CLAUDE.md's verification checklist — CLAUDE.md is the actual source of
 # truth for what "passing" means; this recipe just saves retyping it.
 #
+# `loom` and `miri` are deliberately NOT part of `check` or CI: both need
+# a non-default toolchain setup (a nightly + the miri component, or a
+# `--cfg` flag plus `--release` for loom's exhaustive search to finish in
+# a reasonable time) and both are slow — minutes, not seconds, for a
+# workspace this size. Run them deliberately, not on every push; see
+# `crates/qaas-core/tests/loom_*.rs`'s own module docs for what each
+# actually checks and why it's scoped to qaas-core specifically.
+#
 # Note: `just --list` only shows the single comment line directly above
 # each recipe, so keep those one-liners — put anything longer here in
 # the file header instead of over a recipe.
@@ -47,3 +55,11 @@ check:
 # Auto-fix formatting
 fmt:
     cargo fmt --all
+
+# Exhaustive interleaving check for qaas-core's locking models (slow, not part of `check` — see tests/loom_*.rs)
+loom:
+    RUSTFLAGS="--cfg qaas_loom" cargo test --release -p qaas-core --test loom_fifo --test loom_consumer_group
+
+# Run qaas-core's tests under Miri (slow, not part of `check`; needs `rustup component add --toolchain nightly miri`)
+miri:
+    MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test -p qaas-core

@@ -29,6 +29,13 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 crc32fast = "1"
 tempfile = "3"
 fastrand = "2"
+# Exhaustive interleaving search for concurrent code, from the same org
+# as tokio. Only ever compiled under `--cfg loom` (see
+# `tests/loom_*.rs`) — it models `std::sync`/`std::thread`, not an async
+# runtime, so it can't drive `qaas-core`'s actual `tokio::sync::Mutex`-
+# based types directly; what it checks is documented on each loom test
+# file itself.
+loom = "0.7"
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 rmcp = { version = "3", features = ["server", "transport-io", "transport-streamable-http-server"] }
 schemars = "1"
@@ -64,6 +71,17 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
+# `qaas-core/tests/loom_*.rs` are gated on `--cfg qaas_loom` (see their
+# own module docs — `loom` can't drive async code, so those files only
+# ever run deliberately, outside the default `cargo test`/CI loop; the
+# name is deliberately not plain `loom` since a global `RUSTFLAGS --cfg
+# loom` would also flip tokio's own internals into its test-only loom
+# mode and break the real tokio this crate depends on elsewhere).
+# Declaring it here is what tells rustc that's an intentional, known cfg
+# rather than a typo — without it, every crate in the workspace would
+# warn `unexpected_cfgs` on every build, and `-D warnings` would turn
+# that into a hard failure for code that never even sets the flag.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(qaas_loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
